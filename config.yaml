@@ -65,7 +65,7 @@ model:
 sahi:
   enabled: true           # 是否启用 SAHI
   slice_size: 640         # 切片大小
-  overlap_ratio: 0.2      # 切片重叠比例（0.2 = 20%重叠）
+  overlap_ratio: 0.1      # 切片重叠比例（0.2 = 20%重叠）
   iou_threshold: 0.5      # NMS 合并 IoU 阈值
 
 cleanup:

@@ -321,14 +321,18 @@ class StreamWorker:
             else:
                 detections, inference_time, raw_results = [], 0, []
 
-            # 自适应调整间隔
+            # 自适应调整间隔（SAHI 慢时允许更大间隔）
             frame_interval = 1000.0 / 25
             if inference_time < frame_interval * 0.8:
                 self._detection_interval = 1
             elif inference_time < frame_interval * 1.5:
                 self._detection_interval = 2
+            elif inference_time < frame_interval * 3:
+                self._detection_interval = 4
+            elif inference_time < frame_interval * 5:
+                self._detection_interval = 8
             else:
-                self._detection_interval = 3
+                self._detection_interval = 10  # 188ms 检测 → 每10帧检测一次 针对慢检测的容错
 
             self._skip_counter = 0
 

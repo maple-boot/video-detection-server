@@ -38,7 +38,8 @@ async def start_stream(request: StreamRequest):
             for alg_id in algorithm_ids:
                 existing = _orm_helper.get_task_record(int(task_id), alg_id)
                 if existing:
-                    logger.info(f"任务已存在，跳过 | task_id={task_id} | algorithm_id={alg_id}")
+                    # 跳过打印
+                    # logger.info(f"任务已存在，跳过 | task_id={task_id} | algorithm_id={alg_id}")
                     push_url = f"rtmp://112.14.53.185/live/stream/{task_id}_{alg_id}"
                     return ResponseHelper.success(
                         data={"output_url": push_url.replace('rtmp://', 'webrtc://'), "taskId": task_id}
