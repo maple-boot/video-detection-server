@@ -150,73 +150,131 @@ class InferenceEngine:
                 if x_positions[-1] + slice_size < w:
                     x_positions.append(w - slice_size)
 
-                # 对每个切片进行检测
+                # 对每个切片进行检测 单T4显卡推理太慢，选择使用收集所有切片进行批量推理
+                # for y in y_positions:
+                #     for x in x_positions:
+                #         # 提取切片
+                #         y_end = min(y + slice_size, h)
+                #         x_end = min(x + slice_size, w)
+                #         slice_img = frame[y:y_end, x:x_end]
+                #
+                #         # 如果切片尺寸不足，pad 到 slice_size
+                #         sh, sw = slice_img.shape[:2]
+                #         if sh < slice_size or sw < slice_size:
+                #             padded = np.full((slice_size, slice_size, 3), 114, dtype=np.uint8)
+                #             padded[:sh, :sw] = slice_img
+                #             slice_img = padded
+                #
+                #         # YOLO 检测
+                #         results = model.predict(
+                #             slice_img,
+                #             conf=conf,
+                #             imgsz=imgsz,
+                #             verbose=False,
+                #             device="0",
+                #         )
+                #
+                #         # 提取结果并映射回原始坐标
+                #         for result in results:
+                #             boxes = result.boxes
+                #             if boxes is None:
+                #                 continue
+                #
+                #             for i in range(len(boxes)):
+                #                 box = boxes.xyxy[i].cpu().numpy()
+                #                 conf_val = float(boxes.conf[i].cpu().numpy())
+                #                 cls_id = int(boxes.cls[i].cpu().numpy())
+                #
+                #                 # 坐标映射回原始图
+                #                 x1 = float(box[0]) + x
+                #                 y1 = float(box[1]) + y
+                #                 x2 = float(box[2]) + x
+                #                 y2 = float(box[3]) + y
+                #
+                #                 # 裁剪到图像边界
+                #                 x1 = max(0, min(x1, w))
+                #                 y1 = max(0, min(y1, h))
+                #                 x2 = max(0, min(x2, w))
+                #                 y2 = max(0, min(y2, h))
+                #
+                #                 class_name = classes[cls_id] if cls_id < len(classes) else str(cls_id)
+                #
+                #                 all_detections.append({
+                #                     "bbox": [x1, y1, x2, y2],
+                #                     "confidence": conf_val,
+                #                     "class_id": cls_id,
+                #                     "class_name": class_name,
+                #                 })
+                #
+                # inference_time = (time.time() - t0) * 1000
+                # # NMS 合并重叠检测
+                # merged_detections = self._nms_merge(all_detections, iou_threshold)
+                # logger.debug(
+                #     f"SAHI 检测完成 | 切片数={len(y_positions) * len(x_positions)} | "
+                #     f"原始检测={len(all_detections)} | 合并后={len(merged_detections)} | "
+                #     f"耗时={inference_time:.1f}ms"
+                # )
+                # ------------------------
+
+                slices = []
+                slice_coords = []
                 for y in y_positions:
                     for x in x_positions:
-                        # 提取切片
                         y_end = min(y + slice_size, h)
                         x_end = min(x + slice_size, w)
                         slice_img = frame[y:y_end, x:x_end]
 
-                        # 如果切片尺寸不足，pad 到 slice_size
                         sh, sw = slice_img.shape[:2]
                         if sh < slice_size or sw < slice_size:
                             padded = np.full((slice_size, slice_size, 3), 114, dtype=np.uint8)
                             padded[:sh, :sw] = slice_img
                             slice_img = padded
 
-                        # YOLO 检测
-                        results = model.predict(
-                            slice_img,
-                            conf=conf,
-                            imgsz=imgsz,
-                            verbose=False,
-                            device="0",
-                        )
-
-                        # 提取结果并映射回原始坐标
-                        for result in results:
-                            boxes = result.boxes
-                            if boxes is None:
-                                continue
-
-                            for i in range(len(boxes)):
-                                box = boxes.xyxy[i].cpu().numpy()
-                                conf_val = float(boxes.conf[i].cpu().numpy())
-                                cls_id = int(boxes.cls[i].cpu().numpy())
-
-                                # 坐标映射回原始图
-                                x1 = float(box[0]) + x
-                                y1 = float(box[1]) + y
-                                x2 = float(box[2]) + x
-                                y2 = float(box[3]) + y
-
-                                # 裁剪到图像边界
-                                x1 = max(0, min(x1, w))
-                                y1 = max(0, min(y1, h))
-                                x2 = max(0, min(x2, w))
-                                y2 = max(0, min(y2, h))
-
-                                class_name = classes[cls_id] if cls_id < len(classes) else str(cls_id)
-
-                                all_detections.append({
-                                    "bbox": [x1, y1, x2, y2],
-                                    "confidence": conf_val,
-                                    "class_id": cls_id,
-                                    "class_name": class_name,
-                                })
+                        slices.append(slice_img)
+                        slice_coords.append((x, y))
+                # 批量推理：所有切片一次送入 GPU
+                results = model.predict(
+                    slices,
+                    conf=conf,
+                    imgsz=imgsz,
+                    verbose=False,
+                    device="0",
+                )
 
                 inference_time = (time.time() - t0) * 1000
 
-                # NMS 合并重叠检测
-                merged_detections = self._nms_merge(all_detections, iou_threshold)
+                # 映射坐标
+                all_detections = []
+                for idx, result in enumerate(results):
+                    x_off, y_off = slice_coords[idx]
+                    boxes = result.boxes
+                    if boxes is None:
+                        continue
+                    for i in range(len(boxes)):
+                        box = boxes.xyxy[i].cpu().numpy()
+                        conf_val = float(boxes.conf[i].cpu().numpy())
+                        cls_id = int(boxes.cls[i].cpu().numpy())
+
+                        x1 = max(0, min(float(box[0]) + x_off, w))
+                        y1 = max(0, min(float(box[1]) + y_off, h))
+                        x2 = max(0, min(float(box[2]) + x_off, w))
+                        y2 = max(0, min(float(box[3]) + y_off, h))
+
+                        class_name = classes[cls_id] if cls_id < len(classes) else str(cls_id)
+
+                        all_detections.append({
+                            "bbox": [x1, y1, x2, y2],
+                            "confidence": conf_val,
+                            "class_id": cls_id,
+                            "class_name": class_name,
+                        })
+
+                merged = self._nms_merge(all_detections, iou_threshold)
 
                 logger.debug(
-                    f"SAHI 检测完成 | 切片数={len(y_positions) * len(x_positions)} | "
-                    f"原始检测={len(all_detections)} | 合并后={len(merged_detections)} | "
-                    f"耗时={inference_time:.1f}ms"
+                    f"SAHI | slices={len(slices)} | raw={len(all_detections)} | "
+                    f"merged={len(merged)} | time={inference_time:.1f}ms"
                 )
-
                 return merged_detections, inference_time, []
 
             except Exception as e:
