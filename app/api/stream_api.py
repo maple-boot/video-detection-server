@@ -61,7 +61,9 @@ async def start_stream(request: StreamRequest):
                 output_path=output_path,
             )
             if success:
-                return ResponseHelper.success(data={"pushUrl": output_path, "taskId": task_id})
+                worker_task_id = f"{task_id}_{algorithm_ids}"
+                push_url = f"rtmp://112.14.53.185/live/stream/{worker_task_id}"
+                return ResponseHelper.success(data={"output_url": push_url.replace('rtmp://', 'webrtc://'), "taskId": task_id})
             else:
                 return ResponseHelper.error("任务启动失败")
         else:
@@ -104,6 +106,7 @@ async def start_stream(request: StreamRequest):
             return ResponseHelper.success(data={
                 "taskId": task_id,
                 "streams": results,
+                "output_url":results[0]["pushUrl"],
             })
 
     except Exception as e:
@@ -150,6 +153,7 @@ async def stop_stream(request: StopTaskRequest):
 
         # 构造 worker_task_id
         worker_task_id = f"{task_id}_{algorithm_id}"
+        logger.info(f"需要关闭的任务ID | worker_task_id={worker_task_id} ")
 
         # 停止 Worker
         success = _supervisor.stop_worker(worker_task_id)

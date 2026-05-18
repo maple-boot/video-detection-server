@@ -275,7 +275,7 @@ class InferenceEngine:
                     f"SAHI | slices={len(slices)} | raw={len(all_detections)} | "
                     f"merged={len(merged)} | time={inference_time:.1f}ms"
                 )
-                return merged_detections, inference_time, []
+                return merged, inference_time, []
 
             except Exception as e:
                 logger.error(f"SAHI 检测异常 | algorithm_id={algorithm_id} | error={e}")

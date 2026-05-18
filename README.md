@@ -34,7 +34,7 @@ SRS  推流目标: `rtmp://112.14.53.185/live/stream/`
 **预计版本：FFmpeg 6.1.2（LTS 长期维护版本） 服务器限制实际使用 4.2.7**
 
 ``` 环境安装命令
-conda create -n video-detection python=3.10 -y
+conda create -n video-detection-server python=3.10 -y
 conda activate video-detection
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 pip install -r requirements.txt
@@ -50,7 +50,7 @@ nohup python main.py > /usr/local/nbuav/ai/video-detection-server/logs/app.log 2
 ```
 
 # 测试接口
-curl -X POST http://112.14.53.185:6950/stream \
+curl -v -X POST http://112.14.53.185:6950/stream \
   -H "Content-Type: application/json" \
   -d '{
     "streamUrl": "http://112.14.53.185:9000/nbuav/upload/file/99a7239c-d0f2-4733-a4be-becede2892a1.mp4?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=hxm%2F20260506%2Fnbuav%2Fs3%2Faws4_request&X-Amz-Date=20260506T081112Z&X-Amz-Expires=3600&X-Amz-SignedHeaders=host&X-Amz-Signature=fea105d6076d27b978ca2324eea657fa35ecd69301a3184043b7bac0acf39b15",
