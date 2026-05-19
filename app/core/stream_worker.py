@@ -151,13 +151,13 @@ class StreamWorker:
 
         # 预热帧数（跳过 FFmpeg 解码器初始化期间的脏数据）
         warmup_frames = self.config.get("ffmpeg", {}).get("warmup_frames", 15)
-
         # 主循环
         while not self._stop_event.is_set():
             t_start = time.time()
 
             # 读取最新帧，跳过积压
-            success, frame = self.video_capture.read(skip_old=True)
+            # success, frame = self.video_capture.read(skip_old=True)
+            success, frame = self._read_latest_frame()
             if not success:
                 if self.video_capture.is_live:
                     self._reconnect_count += 1
@@ -239,60 +239,28 @@ class StreamWorker:
 
             self._consecutive_success += 1
 
-    # def _run_detection(self, alg_id: str, frame: np.ndarray) -> tuple:
-    #     """执行检测（带自适应间隔 + SAHI 切片）"""
-    #     if self._skip_counter >= self._detection_interval:
-    #         # SAHI 配置
-    #         sahi_config = self.config.get("sahi", {})
-    #         use_sahi = sahi_config.get("enabled", False)
-    #
-    #         if use_sahi:
-    #             result = self.inference_engine.detect_sahi(
-    #                 alg_id, frame,
-    #                 conf=self.config.get("model", {}).get("default_conf", 0.75),
-    #                 imgsz=self.config.get("model", {}).get("imgsz", 640),
-    #                 slice_size=sahi_config.get("slice_size", 640),
-    #                 overlap_ratio=sahi_config.get("overlap_ratio", 0.2),
-    #                 iou_threshold=sahi_config.get("iou_threshold", 0.5),
-    #             )
-    #         else:
-    #             result = self.inference_engine.detect(
-    #                 alg_id, frame,
-    #                 conf=self.config.get("model", {}).get("default_conf", 0.75),
-    #                 imgsz=self.config.get("model", {}).get("imgsz", 640),
-    #             )
-    #
-    #         if isinstance(result, tuple) and len(result) == 3:
-    #             detections, inference_time, raw_results = result
-    #         elif isinstance(result, tuple) and len(result) == 2:
-    #             detections, inference_time = result
-    #             raw_results = []
-    #         else:
-    #             detections, inference_time, raw_results = [], 0, []
-    #
-    #         # 自适应调整间隔
-    #         frame_interval = 1000.0 / 25
-    #         if inference_time < frame_interval * 0.8:
-    #             self._detection_interval = 1
-    #         elif inference_time < frame_interval * 1.5:
-    #             self._detection_interval = 2
-    #         else:
-    #             self._detection_interval = 3
-    #
-    #         self._skip_counter = 0
-    #
-    #         # ByteTrack 追踪（SAHI 模式下 raw_results 为空，跳过追踪）
-    #         if raw_results:
-    #             detections = self._track(alg_id, detections, frame, raw_results)
-    #         elif detections:
-    #             # SAHI 模式：无 raw_results，直接使用检测结果
-    #             pass
-    #
-    #         if detections:
-    #             self._last_detections[alg_id] = detections
-    #         return self._last_detections.get(alg_id, []), inference_time
-    #     else:
-    #         return self._last_detections.get(alg_id, []),
+    def _read_latest_frame(self):
+        """读取缓冲区中的最新帧，丢弃中间所有旧帧"""
+        if self.video_capture is None:
+            return False, None
+        # 读取第一帧
+        success, frame = self.video_capture.read(skip_old=True)
+        if not success:
+            return False, None
+        # 丢弃缓冲区中的旧帧，只保留最后一帧
+        skipped = 0
+        while True:
+            peek_success, peek_frame = self.video_capture.read(skip_old=True)
+            if not peek_success:
+                break
+            frame = peek_frame  # 用更新的帧覆盖
+            skipped += 1
+            if skipped >= 10:  # 安全限制
+                break
+        if skipped > 0:
+            self._dropped_count += skipped
+        return True, frame
+
 
     def _run_detection(self, alg_id: str, frame: np.ndarray) -> tuple:
         """执行检测（带自适应间隔 + SAHI 切片 + ByteTrack）"""
@@ -430,8 +398,10 @@ class StreamWorker:
     def _draw_boxes(self, frame: np.ndarray, detections: list,
                     conf_threshold: float = 0.75) -> np.ndarray:
         """绘制检测框（含 track_id，支持中文）"""
-
-
+        # 循环外执行 PIL 图像转换
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(frame_rgb)
+        draw = ImageDraw.Draw(pil_img)
         for det in detections:
             if det["confidence"] < conf_threshold:
                 continue
@@ -439,35 +409,23 @@ class StreamWorker:
             x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
             track_id = det.get("track_id", 0)
             color = self._get_color(track_id)
-
             # OpenCV 绘制矩形框
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-
             # PIL 绘制中文文字
             label = f"ID:{track_id} {det['class_name']} {det['confidence']:.2f}"
-
-            # 转为 PIL 图像
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            pil_img = Image.fromarray(frame_rgb)
-            draw = ImageDraw.Draw(pil_img)
-
             # 加载字体（优先使用系统中文字体）
             font = self._get_chinese_font(16)
-
             # 计算文字背景
             text_bbox = draw.textbbox((x1, y1 - 25), label, font=font)
             text_w = text_bbox[2] - text_bbox[0]
             text_h = text_bbox[3] - text_bbox[1]
-
             # 绘制文字背景
             draw.rectangle(
                 [x1, y1 - text_h - 5, x1 + text_w + 5, y1],
                 fill=color,
             )
-
             # 绘制文字
             draw.text((x1 + 2, y1 - text_h - 3), label, fill=(255, 255, 255), font=font)
-
             # 转回 OpenCV 格式
             frame = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
 

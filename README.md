@@ -33,6 +33,17 @@ SRS  推流目标: `rtmp://112.14.53.185/live/stream/`
 
 **预计版本：FFmpeg 6.1.2（LTS 长期维护版本） 服务器限制实际使用 4.2.7**
 
+``` FFmpeg 安装
+# 更新软件包列表
+apt update
+# 安装 ffmpeg
+apt install ffmpeg
+# 验证安装
+ffmpeg -version
+```
+
+
+
 ``` 环境安装命令
 conda create -n video-detection-server python=3.10 -y
 conda activate video-detection

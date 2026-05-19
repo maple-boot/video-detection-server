@@ -2,12 +2,11 @@ import subprocess
 import threading
 import time
 import numpy as np
-import os
 from app.utils.logger import get_task_logger
 
 
 class FFmpegHelper:
-    """FFmpeg 推流 — 阻塞写入 + 最新帧覆盖"""
+    """FFmpeg 推流 — h264_nvenc + 最新帧覆盖"""
 
     def __init__(self, push_url: str, width: int, height: int, fps: int,
                  task_id: str = "system", algorithm_id: str = "",
@@ -48,13 +47,16 @@ class FFmpegHelper:
             "-s", f"{self.width}x{self.height}",
             "-r", str(self.fps),
             "-i", "pipe:0",
-            "-c:v", "libx264",
-            "-preset", self.preset,
-            "-tune", self.tune,
-            "-pix_fmt", "yuv420p",
+            "-c:v", "h264_nvenc",
+            "-preset", "fast",
+            "-tune", "ll",
+            "-rc", "cbr",
+            "-b:v", "4M",
+            "-maxrate", "4M",
+            "-bufsize", "2M",
             "-g", str(self.fps),
             "-bf", "0",
-            "-x264-params", "rc-lookahead=0:sliced-threads=1:sync-lookahead=0",
+            "-pix_fmt", "yuv420p",
             "-flush_packets", "1",
             "-max_muxing_queue_size", "2",
             "-max_delay", "0",
@@ -68,7 +70,22 @@ class FFmpegHelper:
                 stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
+                bufsize=0,
             )
+
+            # 等 0.5 秒检查 FFmpeg 是否正常运行
+            time.sleep(0.5)
+            if self.process.poll() is not None:
+                stderr_output = ""
+                try:
+                    stderr_output = self.process.stderr.read().decode("utf-8", errors="replace")
+                except Exception:
+                    pass
+                self.logger.error(
+                    f"FFmpeg 启动后立即退出 | returncode={self.process.returncode} | stderr={stderr_output}"
+                )
+                return False
+
             self.running = True
 
             self.stderr_thread = threading.Thread(
@@ -85,7 +102,8 @@ class FFmpegHelper:
 
             self.logger.info(
                 f"FFmpeg 推流启动 | pid={self.process.pid} | "
-                f"push_url={self.push_url} | 分辨率={self.width}x{self.height}"
+                f"push_url={self.push_url} | 分辨率={self.width}x{self.height} | "
+                f"编码=h264_nvenc"
             )
             return True
 
@@ -94,8 +112,11 @@ class FFmpegHelper:
             return False
 
     def write_frame(self, frame: np.ndarray) -> bool:
-        """主循环调用：更新最新帧，完全非阻塞"""
         if not self.running:
+            return False
+        if self.process and self.process.poll() is not None:
+            self.logger.warning(f"write_frame: FFmpeg 进程已退出")
+            self.running = False
             return False
         with self._frame_lock:
             self._latest_frame = frame
@@ -103,36 +124,22 @@ class FFmpegHelper:
         return True
 
     def _write_loop(self):
-        """
-        核心逻辑：
-        1. 固定间隔(40ms)醒来
-        2. 拿最新帧
-        3. 阻塞写入（如果 FFmpeg 慢，这里会等）
-        4. 写完后回到步骤1，此时 _latest_frame 已被主循环更新为更新的帧
-        5. 中间帧自动跳过
-        """
-        frame_interval = 1.0 / self.fps
-
         self.logger.info(f"写帧线程启动 | target_fps={self.fps}")
-
+        frame_interval = 1.0 / self.fps  # 40ms
         while self.running and self.process and self.process.poll() is None:
-            # 等待新帧或超时
+            t_start = time.time()
             self._frame_event.wait(timeout=frame_interval)
             self._frame_event.clear()
-
             if self.process.poll() is not None:
-                self.logger.warning("FFmpeg 进程已退出")
+                self.logger.warning(f"FFmpeg 进程已退出 | returncode={self.process.returncode}")
                 self.running = False
                 break
-
-            # 取最新帧（不加锁取引用，Python GIL 保证原子性）
-            frame = self._latest_frame
+            with self._frame_lock:
+                frame = self._latest_frame
+                self._latest_frame = None
             if frame is None:
                 continue
-
             self._current_push_frame = frame
-
-            # 阻塞写入
             try:
                 self.process.stdin.write(frame.tobytes())
                 self.process.stdin.flush()
@@ -145,26 +152,47 @@ class FFmpegHelper:
                 self.logger.error(f"FFmpeg 写帧异常: {e}")
                 self.running = False
                 break
-
-            if self._frames_written % 250 == 0:
+            # ★ 帧率控制：确保写帧间隔 >= 40ms
+            elapsed = time.time() - t_start
+            if elapsed < frame_interval:
+                time.sleep(frame_interval - elapsed)
+            if self._frames_written % 50 == 0:
                 self.logger.info(
                     f"推流统计 | written={self._frames_written} | dropped={self._frames_dropped}"
                 )
 
         self.logger.info(
-            f"写帧线程退出 | written={self._frames_written} | dropped={self._frames_dropped} "
+            f"写帧线程退出 | written={self._frames_written} | dropped={self._frames_dropped}"
         )
 
+
     def _consume_stderr(self):
+        """消费 FFmpeg stderr — 打印所有输出用于调试"""
         try:
             while self.running and self.process and self.process.poll() is None:
                 line = self.process.stderr.readline()
-                if line:
-                    decoded = line.decode("utf-8", errors="replace").strip()
-                    if "error" in decoded.lower() and "deprecated" not in decoded.lower():
-                        self.logger.error(f"FFmpeg: {decoded}")
-        except Exception:
-            pass
+                if not line:
+                    break
+                decoded = line.decode("utf-8", errors="replace").strip()
+                if not decoded:
+                    continue
+
+                decoded_lower = decoded.lower()
+
+                # 过滤无意义的进度信息
+                if "frame=" in decoded_lower or "fps=" in decoded_lower:
+                    continue
+
+                # 根据内容分级日志
+                if "error" in decoded_lower and "deprecated" not in decoded_lower:
+                    self.logger.error(f"FFmpeg: {decoded}")
+                elif "warning" in decoded_lower:
+                    self.logger.warning(f"FFmpeg: {decoded}")
+                else:
+                    self.logger.debug(f"FFmpeg: {decoded}")
+
+        except Exception as e:
+            self.logger.error(f"FFmpeg stderr 消费异常: {e}")
 
     def stop(self):
         self.running = False
