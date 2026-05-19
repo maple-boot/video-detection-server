@@ -11,6 +11,7 @@ import traceback
 from datetime import datetime
 from enum import Enum
 from PIL import ImageFont
+from queue import Queue
 from PIL import Image, ImageDraw, ImageFont
 from app.core.video_capture import VideoCapture
 from app.utils.ffmpeg_helper import FFmpegHelper
@@ -89,6 +90,15 @@ class StreamWorker:
         self._reconnect_count = 0
         # 连续检测配置
         self._min_report_frames = self.config.get("tracker", {}).get("min_report_frames", 5)
+        # 回调上报队列
+        self._report_queue = Queue()
+        self._report_worker = threading.Thread(
+            target=self._process_report_queue,
+            daemon=True,
+            name=f"report_worker_{task_id}"
+        )
+        self._report_worker.start()
+
 
     def start(self):
         """启动 Worker"""
@@ -156,8 +166,7 @@ class StreamWorker:
             t_start = time.time()
 
             # 读取最新帧，跳过积压
-            # success, frame = self.video_capture.read(skip_old=True)
-            success, frame = self._read_latest_frame()
+            success, frame = self.video_capture.read(skip_old=True)
             if not success:
                 if self.video_capture.is_live:
                     self._reconnect_count += 1
@@ -238,29 +247,6 @@ class StreamWorker:
                 )
 
             self._consecutive_success += 1
-
-    def _read_latest_frame(self):
-        """读取缓冲区中的最新帧，丢弃中间所有旧帧"""
-        if self.video_capture is None:
-            return False, None
-        # 读取第一帧
-        success, frame = self.video_capture.read(skip_old=True)
-        if not success:
-            return False, None
-        # 丢弃缓冲区中的旧帧，只保留最后一帧
-        skipped = 0
-        while True:
-            peek_success, peek_frame = self.video_capture.read(skip_old=True)
-            if not peek_success:
-                break
-            frame = peek_frame  # 用更新的帧覆盖
-            skipped += 1
-            if skipped >= 10:  # 安全限制
-                break
-        if skipped > 0:
-            self._dropped_count += skipped
-        return True, frame
-
 
     def _run_detection(self, alg_id: str, frame: np.ndarray) -> tuple:
         """执行检测（带自适应间隔 + SAHI 切片 + ByteTrack）"""
@@ -532,10 +518,33 @@ class StreamWorker:
                 self._report_completed_track(alg_id, track_data, original_frame, annotated_frame)
 
 
-    def _report_completed_track(self, alg_id: str, track_data: dict,
-                                original_frame: np.ndarray, annotated_frame: np.ndarray):
+    def _report_completed_track(self, alg_id, track_data, original_frame, annotated_frame):
+        """放入队列，不阻塞主循环"""
+        self._report_queue.put({
+            "alg_id": alg_id,
+            "track_data": track_data,
+            "original_frame": original_frame.copy(),
+            "annotated_frame": annotated_frame.copy(),
+        })
+
+    def _process_report_queue(self):
+        """队列消费：逐个处理上报"""
+        while True:
+            item = self._report_queue.get()
+            try:
+                self._do_report(item)
+            except Exception as e:
+                self.logger.error(f"上报异常: {e}")
+            finally:
+                self._report_queue.task_done()
+
+    def _do_report(self, item):
         """上报已完成的轨迹"""
         try:
+            alg_id = item["alg_id"]
+            track_data = item["track_data"]
+            original_frame = item["original_frame"]
+            annotated_frame = item["annotated_frame"]
             # 获取定位信息
             location = None
             if self.orm_helper:
@@ -735,7 +744,7 @@ class StreamWorker:
             self.video_capture.release()
             self.video_capture = None
         if self.ffmpeg_pusher:
-            self.ffmpeg_pusher.stop()
+            self.ffmpeg_pusher.stop()  # stop() 内部会确保杀掉进程
             self.ffmpeg_pusher = None
 
     def stop(self):

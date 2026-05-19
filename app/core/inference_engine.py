@@ -59,15 +59,15 @@ class InferenceEngine:
     def detect(self, algorithm_id: str, frame: np.ndarray,
                conf: float = 0.75, imgsz: int = 640) -> tuple:
         """执行检测，返回 (detections, inference_time, raw_results)"""
-        with self._lock:
-            if algorithm_id not in self._models:
-                return [], 0, []
+        if algorithm_id not in self._models:
+            return [], 0, []
 
-            try:
-                model_info = self._models[algorithm_id]
-                model = model_info["model"]
-                classes = model_info["classes"]
+        try:
+            model_info = self._models[algorithm_id]
+            model = model_info["model"]
+            classes = model_info["classes"]
 
+            with self._lock:
                 t0 = time.time()
                 results = model.predict(
                     frame,
@@ -78,79 +78,77 @@ class InferenceEngine:
                 )
                 inference_time = (time.time() - t0) * 1000
 
-                detections = []
-                for result in results:
-                    boxes = result.boxes
-                    if boxes is None:
-                        continue
-                    for i in range(len(boxes)):
-                        box = boxes.xyxy[i].cpu().numpy()
-                        conf_val = float(boxes.conf[i].cpu().numpy())
-                        cls_id = int(boxes.cls[i].cpu().numpy())
-                        class_name = classes[cls_id] if cls_id < len(classes) else str(cls_id)
-                        detections.append({
-                            "bbox": box.tolist(),
-                            "confidence": conf_val,
-                            "class_id": cls_id,
-                            "class_name": class_name,
-                        })
+            detections = []
+            for result in results:
+                boxes = result.boxes
+                if boxes is None:
+                    continue
+                for i in range(len(boxes)):
+                    box = boxes.xyxy[i].cpu().numpy()
+                    conf_val = float(boxes.conf[i].cpu().numpy())
+                    cls_id = int(boxes.cls[i].cpu().numpy())
+                    class_name = classes[cls_id] if cls_id < len(classes) else str(cls_id)
+                    detections.append({
+                        "bbox": box.tolist(),
+                        "confidence": conf_val,
+                        "class_id": cls_id,
+                        "class_name": class_name,
+                    })
 
-                return detections, inference_time, results
-
-            except Exception as e:
-                logger.error(f"推理异常 | algorithm_id={algorithm_id} | error={e}")
-                return [], 0, []
+            return detections, inference_time, results
+        except Exception as e:
+            logger.error(f"推理异常 | algorithm_id={algorithm_id} | error={e}")
+            return [], 0, []
 
     def detect_sahi(self, algorithm_id: str, frame: np.ndarray,
                     conf: float = 0.75, imgsz: int = 640,
                     slice_size: int = 640, overlap_ratio: float = 0.1,
                     iou_threshold: float = 0.5) -> tuple:
         """SAHI 切片检测"""
-        with self._lock:
-            if algorithm_id not in self._models:
-                return [], 0, []
+        if algorithm_id not in self._models:
+            return [], 0, []
 
-            try:
-                model_info = self._models[algorithm_id]
-                model = model_info["model"]
-                classes = model_info["classes"]
-                is_tensorrt = model_info.get("is_tensorrt", False)
+        try:
+            model_info = self._models[algorithm_id]
+            model = model_info["model"]
+            classes = model_info["classes"]
+            is_tensorrt = model_info.get("is_tensorrt", False)
 
-                h, w = frame.shape[:2]
+            h, w = frame.shape[:2]
 
-                if h <= slice_size and w <= slice_size:
-                    return self.detect(algorithm_id, frame, conf, imgsz)
+            if h <= slice_size and w <= slice_size:
+                return self.detect(algorithm_id, frame, conf, imgsz)
 
+            step = int(slice_size * (1 - overlap_ratio))
+            y_positions = list(range(0, max(1, h - slice_size + 1), step))
+            x_positions = list(range(0, max(1, w - slice_size + 1), step))
+
+            if y_positions[-1] + slice_size < h:
+                y_positions.append(h - slice_size)
+            if x_positions[-1] + slice_size < w:
+                x_positions.append(w - slice_size)
+
+            slices = []
+            slice_coords = []
+            for y in y_positions:
+                for x in x_positions:
+                    y_end = min(y + slice_size, h)
+                    x_end = min(x + slice_size, w)
+                    slice_img = frame[y:y_end, x:x_end]
+
+                    sh, sw = slice_img.shape[:2]
+                    if sh < slice_size or sw < slice_size:
+                        padded = np.full((slice_size, slice_size, 3), 114, dtype=np.uint8)
+                        padded[:sh, :sw] = slice_img
+                        slice_img = padded
+
+                    slices.append(slice_img)
+                    slice_coords.append((x, y))
+
+            actual_count = len(slices)
+
+            with self._lock:
                 t0 = time.time()
-
-                step = int(slice_size * (1 - overlap_ratio))
-                y_positions = list(range(0, max(1, h - slice_size + 1), step))
-                x_positions = list(range(0, max(1, w - slice_size + 1), step))
-
-                if y_positions[-1] + slice_size < h:
-                    y_positions.append(h - slice_size)
-                if x_positions[-1] + slice_size < w:
-                    x_positions.append(w - slice_size)
-
-                slices = []
-                slice_coords = []
-                for y in y_positions:
-                    for x in x_positions:
-                        y_end = min(y + slice_size, h)
-                        x_end = min(x + slice_size, w)
-                        slice_img = frame[y:y_end, x:x_end]
-
-                        sh, sw = slice_img.shape[:2]
-                        if sh < slice_size or sw < slice_size:
-                            padded = np.full((slice_size, slice_size, 3), 114, dtype=np.uint8)
-                            padded[:sh, :sw] = slice_img
-                            slice_img = padded
-
-                        slices.append(slice_img)
-                        slice_coords.append((x, y))
-
-                actual_count = len(slices)
-
                 # TensorRT：填充到 batch=8 的整数倍
                 if is_tensorrt:
                     batch_size = 8
@@ -167,49 +165,48 @@ class InferenceEngine:
                     device="0",
                     batch=8 if is_tensorrt else len(slices),
                 )
-
                 # 只取实际切片的结果，丢弃填充的
                 all_results = all_results[:actual_count]
                 inference_time = (time.time() - t0) * 1000
-                # 映射坐标回原图
-                all_detections = []
-                for idx, result in enumerate(all_results):
-                    x_off, y_off = slice_coords[idx]
-                    boxes = result.boxes
-                    if boxes is None:
-                        continue
+            # 映射坐标回原图
+            all_detections = []
+            for idx, result in enumerate(all_results):
+                x_off, y_off = slice_coords[idx]
+                boxes = result.boxes
+                if boxes is None:
+                    continue
 
-                    for i in range(len(boxes)):
-                        box = boxes.xyxy[i].cpu().numpy()
-                        conf_val = float(boxes.conf[i].cpu().numpy())
-                        cls_id = int(boxes.cls[i].cpu().numpy())
+                for i in range(len(boxes)):
+                    box = boxes.xyxy[i].cpu().numpy()
+                    conf_val = float(boxes.conf[i].cpu().numpy())
+                    cls_id = int(boxes.cls[i].cpu().numpy())
 
-                        x1 = max(0, min(float(box[0]) + x_off, w))
-                        y1 = max(0, min(float(box[1]) + y_off, h))
-                        x2 = max(0, min(float(box[2]) + x_off, w))
-                        y2 = max(0, min(float(box[3]) + y_off, h))
+                    x1 = max(0, min(float(box[0]) + x_off, w))
+                    y1 = max(0, min(float(box[1]) + y_off, h))
+                    x2 = max(0, min(float(box[2]) + x_off, w))
+                    y2 = max(0, min(float(box[3]) + y_off, h))
 
-                        class_name = classes[cls_id] if cls_id < len(classes) else str(cls_id)
+                    class_name = classes[cls_id] if cls_id < len(classes) else str(cls_id)
 
-                        all_detections.append({
-                            "bbox": [x1, y1, x2, y2],
-                            "confidence": conf_val,
-                            "class_id": cls_id,
-                            "class_name": class_name,
-                        })
+                    all_detections.append({
+                        "bbox": [x1, y1, x2, y2],
+                        "confidence": conf_val,
+                        "class_id": cls_id,
+                        "class_name": class_name,
+                    })
 
-                merged = self._nms_merge(all_detections, iou_threshold)
+            merged = self._nms_merge(all_detections, iou_threshold)
 
-                logger.debug(
-                    f"SAHI | slices={actual_count} | padded={len(slices)} | tensorrt={is_tensorrt} | "
-                    f"raw={len(all_detections)} | merged={len(merged)} | time={inference_time:.1f}ms"
-                )
+            logger.debug(
+                f"SAHI | slices={actual_count} | padded={len(slices)} | tensorrt={is_tensorrt} | "
+                f"raw={len(all_detections)} | merged={len(merged)} | time={inference_time:.1f}ms"
+            )
 
-                return merged, inference_time, []
+            return merged, inference_time, []
 
-            except Exception as e:
-                logger.error(f"SAHI 检测异常 | algorithm_id={algorithm_id} | error={e}")
-                return [], 0, []
+        except Exception as e:
+            logger.error(f"SAHI 检测异常 | algorithm_id={algorithm_id} | error={e}")
+            return [], 0, []
 
     @staticmethod
     def _nms_merge(detections: list, iou_threshold: float = 0.5) -> list:

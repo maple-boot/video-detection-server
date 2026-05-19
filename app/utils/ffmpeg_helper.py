@@ -2,6 +2,7 @@ import subprocess
 import threading
 import time
 import numpy as np
+import signal
 from app.utils.logger import get_task_logger
 
 
@@ -197,22 +198,39 @@ class FFmpegHelper:
     def stop(self):
         self.running = False
         self._frame_event.set()
-
         if self._writer_thread and self._writer_thread.is_alive():
             self._writer_thread.join(timeout=3)
-
         if self.process:
             try:
-                self.process.stdin.close()
+                #先关 stdin，再 terminate，最后 kill
+                try:
+                    self.process.stdin.close()
+                except Exception:
+                    pass
                 self.process.terminate()
-                self.process.wait(timeout=5)
-                self.logger.info(
-                    f"FFmpeg 推流停止 | written={self._frames_written}"
-                )
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait()
+                try:
+                    self.process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait(timeout=2)
+                self.logger.info(f"FFmpeg 推流停止 | pid={self.process.pid}")
             except Exception as e:
                 self.logger.error(f"FFmpeg 停止异常: {e}")
             finally:
                 self.process = None
+        # 确保进程被杀掉
+        self._kill_ffmpeg_processes()
+
+    def _kill_ffmpeg_processes(self):
+        """杀掉属于本任务的残留 FFmpeg 进程"""
+        try:
+            result = subprocess.run(
+                ["pgrep", "-f", f"ffmpeg.*{self.push_url}"],
+                capture_output=True, text=True
+            )
+            for pid in result.stdout.strip().split('\n'):
+                if pid:
+                    os.kill(int(pid), signal.SIGKILL)
+                    self.logger.warning(f"杀掉残留 FFmpeg 进程 | pid={pid}")
+        except Exception:
+            pass
