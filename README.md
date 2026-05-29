@@ -15,6 +15,37 @@ logs/
 上报流程如下：
 目标出现 → 开始追踪 → 累积检测数据 → 目标消失(track_buffer帧后ByteTrack丢弃) → 上报最终结果
 
+``` 服务器显卡驱动安装命令：
+1、ubuntu-drivers devices
+2、ubuntu-drivers autoinstall
+3、reboot
+# 如果nvidia-smi显示的cuda版本低于12.4，执行以下命令，检查是否有更高版本支持
+1、添加NVIDIA驱动PPA
+add-apt-repository ppa:graphics-drivers/ppa
+apt update
+2、找版本
+apt list 2>/dev/null | grep nvidia-driver
+3、安装可用版本
+apt install nvidia-driver-*version*
+4、重启
+reboot
+```
+```conda 环境安装
+# 下载miniconda
+wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
+# 运行安装命令 (1、ENTER 2、yes 3、直接回车 4、yes)
+bash Miniconda3-latest-Linux-x86_64.sh
+# 手动初始化 如果在安装时没有自动初始化执行此命令
+~/miniconda3/bin/conda init bash
+# 生效环境变量
+source ~/.bashrc
+# 开始配置虚拟环境前，需要同意执行条款
+conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main
+conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
+# 登录时不默认进入conda环境命令
+conda config --set auto_activate_base false
+```
+
 ## 一、环境与依赖
 
 ### 1.1 运行环境
@@ -42,11 +73,9 @@ apt install ffmpeg
 ffmpeg -version
 ```
 
-
-
 ``` 环境安装命令
 conda create -n video-detection-server python=3.10 -y
-conda activate video-detection
+conda activate video-detection-server
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 pip install -r requirements.txt
 ```

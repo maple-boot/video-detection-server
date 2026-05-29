@@ -47,8 +47,9 @@ class FFmpegGPUStreamHandler:
         if hwaccel:
             command.extend(["-hwaccel", hwaccel])
         command.extend([
-            "-fflags", "nobuffer",
+            "-fflags", "nobuffer+discardcorrupt+genpts",
             "-flags", "low_delay",
+            "-thread_queue_size", "64",
             "-probesize", str(self.probe_size),
             "-analyzeduration", str(self.analyzeduration),
         ])

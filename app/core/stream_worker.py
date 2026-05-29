@@ -1,4 +1,5 @@
 import os
+import math
 import time
 import threading
 import aiohttp
@@ -88,6 +89,13 @@ class StreamWorker:
         # 直播流重连配置
         self._max_reconnect = self.config.get("ffmpeg", {}).get("max_reconnect", 10)
         self._reconnect_count = 0
+        # 流健康监控
+        self._last_frame_time = time.time()
+        self._stream_stall_warned = False
+        self._stream_stall_threshold = self.config.get("ffmpeg", {}).get("stream_stall_threshold", 3.0)
+        self._stream_reconnect_threshold = self.config.get("ffmpeg", {}).get("stream_reconnect_threshold", 8.0)
+        self._stall_watchdog = None
+        self._stall_watchdog_stop = threading.Event()
         # 连续检测配置
         self._min_report_frames = self.config.get("tracker", {}).get("min_report_frames", 5)
         # 回调上报队列
@@ -161,12 +169,22 @@ class StreamWorker:
 
         # 预热帧数（跳过 FFmpeg 解码器初始化期间的脏数据）
         warmup_frames = self.config.get("ffmpeg", {}).get("warmup_frames", 15)
+        # 模型检测预热：用空白帧做一次推理，避免首次检测到物体时的 TensorRT 尖峰
+        self._run_detection_warmup()
         # 主循环
         while not self._stop_event.is_set():
             t_start = time.time()
 
+            # ★ 启动流中断看门狗：read() 是阻塞调用，源流中断时永不返回
+            #   看门狗在超时后杀死 FFmpeg，使 read() 失败并触发现有重连逻辑
+            self._start_stall_watchdog()
+
             # 读取最新帧，跳过积压
             success, frame = self.video_capture.read(skip_old=True)
+
+            # ★ 取消看门狗（read() 已返回）
+            self._stop_stall_watchdog()
+
             if not success:
                 if self.video_capture.is_live:
                     self._reconnect_count += 1
@@ -187,6 +205,21 @@ class StreamWorker:
                     # 视频结束/意外断流，上报所有剩余轨迹；避免出现检测物品未成功上报的问题
                     self._flush_all_tracks()
                     break
+
+            # ★ 流健康监控：检测源流是否长时间无帧
+            now = time.time()
+            idle_time = now - self._last_frame_time
+            if idle_time > self._stream_stall_threshold:
+                if not self._stream_stall_warned:
+                    self.logger.warning(
+                        f"源流疑似中断 | 无帧间隔={idle_time:.1f}s | "
+                        f"阈值={self._stream_stall_threshold}s | "
+                        f"frame_count={self._frame_count}"
+                    )
+                    self._stream_stall_warned = True
+            else:
+                self._stream_stall_warned = False
+            self._last_frame_time = now
 
             self._frame_count += 1
             self._skip_counter += 1
@@ -337,7 +370,12 @@ class StreamWorker:
                 conf = float(track[5])
                 cls_id = int(track[6])
 
-                classes = self.inference_engine._models.get(alg_id, {}).get("classes", [])
+                # 多 GPU 推理引擎用 _pools，单 GPU 用 _models
+                if hasattr(self.inference_engine, '_pools'):
+                    pool = self.inference_engine._pools.get(alg_id)
+                    classes = pool.classes if pool else []
+                else:
+                    classes = self.inference_engine._models.get(alg_id, {}).get("classes", [])
                 class_name = classes[cls_id] if cls_id < len(classes) else str(cls_id)
 
                 tracked_detections.append({
@@ -381,41 +419,104 @@ class StreamWorker:
                 self.logger.debug(f"模型已加载 | algorithm_id={alg_id}")
         return True
 
+    def _start_stall_watchdog(self):
+        """启动流中断看门狗：超时后打断阻塞的 read()，触发现有重连逻辑"""
+        self._stall_watchdog_stop.clear()
+        threshold = self._stream_reconnect_threshold
+
+        def watchdog():
+            if self._stall_watchdog_stop.wait(timeout=threshold):
+                return  # 正常返回，无需处理
+            # 超时：源流中断，关闭管道 + 杀死 FFmpeg 解码进程
+            # 不调 restart()——由主循环的统一重连逻辑处理
+            self.logger.warning(
+                f"源流中断超过 {threshold}s，看门狗正在终止 FFmpeg 解码进程 | "
+                f"reconnect_count={self._reconnect_count}/{self._max_reconnect}"
+            )
+            if self.video_capture and self.video_capture._ffmpeg_handler:
+                self.video_capture._ffmpeg_handler.stop()
+
+        self._stall_watchdog = threading.Thread(
+            target=watchdog, daemon=True,
+            name=f"stall_watchdog_{self.task_id}"
+        )
+        self._stall_watchdog.start()
+
+    def _stop_stall_watchdog(self):
+        """取消看门狗（read() 正常返回时调用）"""
+        self._stall_watchdog_stop.set()
+        if self._stall_watchdog and self._stall_watchdog.is_alive():
+            self._stall_watchdog.join(timeout=1)
+        self._stall_watchdog = None
+
+    def _run_detection_warmup(self):
+        """用含模拟目标的图片做推理预热，避免首次检测到物体时的 TensorRT 尖峰"""
+        sahi_config = self.config.get("sahi", {})
+        use_sahi = sahi_config.get("enabled", False)
+
+        for alg_id in self.algorithm_ids:
+            loaded_models = self.inference_engine.get_loaded_models()
+            if alg_id not in loaded_models:
+                continue
+            try:
+                if use_sahi:
+                    self.inference_engine.warmup_detect_with_targets(
+                        alg_id,
+                        imgsz=self.config.get("model", {}).get("imgsz", 640),
+                        slice_size=sahi_config.get("slice_size", 640),
+                        overlap_ratio=sahi_config.get("overlap_ratio", 0.1),
+                        iou_threshold=sahi_config.get("iou_threshold", 0.5),
+                    )
+                else:
+                    # 非 SAHI 模式：用空白帧做一次普通检测预热
+                    warmup_frame = np.zeros((720, 960, 3), dtype=np.uint8)
+                    self.inference_engine.detect(
+                        alg_id, warmup_frame,
+                        conf=self.config.get("model", {}).get("default_conf", 0.75),
+                        imgsz=self.config.get("model", {}).get("imgsz", 640),
+                    )
+                    self.logger.info(f"模型预热完成 | algorithm_id={alg_id}")
+            except Exception as e:
+                self.logger.warning(f"模型预热跳过: {e}")
+
     def _draw_boxes(self, frame: np.ndarray, detections: list,
                     conf_threshold: float = 0.75) -> np.ndarray:
-        """绘制检测框（含 track_id，支持中文）"""
-        # 循环外执行 PIL 图像转换
+        """绘制检测框（含 track_id，支持中文）— PIL统一绘制，修复矩形框丢失bug"""
+        if not detections:
+            return frame
+
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         pil_img = Image.fromarray(frame_rgb)
         draw = ImageDraw.Draw(pil_img)
+        font = self._get_chinese_font(16)
+
         for det in detections:
             if det["confidence"] < conf_threshold:
                 continue
             box = det["bbox"]
+            # 跳过包含 NaN 的无效检测框
+            if any(math.isnan(v) for v in box):
+                continue
             x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
             track_id = det.get("track_id", 0)
-            color = self._get_color(track_id)
-            # OpenCV 绘制矩形框
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            # PIL 绘制中文文字
+            color = self._get_color(track_id)  # PIL中用的是RGB
+
+            # PIL 绘制矩形框（统一在PIL上绘制，避免cv2/PIL混用丢失）
+            draw.rectangle([x1, y1, x2, y2], outline=color, width=2)
+
+            # PIL 绘制中文文字+背景
             label = f"ID:{track_id} {det['class_name']} {det['confidence']:.2f}"
-            # 加载字体（优先使用系统中文字体）
-            font = self._get_chinese_font(16)
-            # 计算文字背景
             text_bbox = draw.textbbox((x1, y1 - 25), label, font=font)
             text_w = text_bbox[2] - text_bbox[0]
             text_h = text_bbox[3] - text_bbox[1]
-            # 绘制文字背景
-            draw.rectangle(
-                [x1, y1 - text_h - 5, x1 + text_w + 5, y1],
-                fill=color,
-            )
-            # 绘制文字
-            draw.text((x1 + 2, y1 - text_h - 3), label, fill=(255, 255, 255), font=font)
-            # 转回 OpenCV 格式
-            frame = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+            if y1 - text_h - 5 > 0:
+                draw.rectangle(
+                    [x1, y1 - text_h - 5, x1 + text_w + 5, y1],
+                    fill=color,
+                )
+                draw.text((x1 + 2, y1 - text_h - 3), label, fill=(255, 255, 255), font=font)
 
-        return frame
+        return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
 
     @staticmethod
     def _get_chinese_font(size: int = 16):
@@ -693,7 +794,12 @@ class StreamWorker:
             conf = float(track[5])
             cls_id = int(track[6])
 
-            classes = self.inference_engine._models.get(alg_id, {}).get("classes", [])
+            # 多 GPU 推理引擎用 _pools，单 GPU 用 _models
+            if hasattr(self.inference_engine, '_pools'):
+                pool = self.inference_engine._pools.get(alg_id)
+                classes = pool.classes if pool else []
+            else:
+                classes = self.inference_engine._models.get(alg_id, {}).get("classes", [])
             class_name = classes[cls_id] if cls_id < len(classes) else str(cls_id)
 
             tracked_detections.append({

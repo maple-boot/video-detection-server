@@ -127,6 +127,8 @@ class FFmpegHelper:
     def _write_loop(self):
         self.logger.info(f"写帧线程启动 | target_fps={self.fps}")
         frame_interval = 1.0 / self.fps  # 40ms
+        idle_cycles = 0
+        max_idle_before_repeat = 5  # 连续 5 个周期(~200ms)无新帧即开始重复最后一帧
         while self.running and self.process and self.process.poll() is None:
             t_start = time.time()
             self._frame_event.wait(timeout=frame_interval)
@@ -139,7 +141,15 @@ class FFmpegHelper:
                 frame = self._latest_frame
                 self._latest_frame = None
             if frame is None:
-                continue
+                # ★ 无新帧时：复用上一帧保持推流不中断（防止推流端黑屏/断流）
+                idle_cycles += 1
+                if idle_cycles >= max_idle_before_repeat and self._current_push_frame is not None:
+                    frame = self._current_push_frame
+                    self._frames_dropped += 1
+                else:
+                    continue
+            else:
+                idle_cycles = 0
             self._current_push_frame = frame
             try:
                 self.process.stdin.write(frame.tobytes())
