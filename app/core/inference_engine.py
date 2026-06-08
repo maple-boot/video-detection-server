@@ -22,6 +22,7 @@ class ModelPool:
         self.gpu_ids = gpu_ids
         self.batch_size = batch_size
         self.is_tensorrt = model_path.endswith(".engine")
+        self.model_type = "TensorRT" if self.is_tensorrt else "PyTorch"
 
         self._models = {}
         self._queues = {}
@@ -31,7 +32,8 @@ class ModelPool:
 
         logger.info(
             f"模型池创建 | algorithm_id={algorithm_id} | "
-            f"gpus={gpu_ids} | tensorrt={self.is_tensorrt} | batch_size={batch_size}"
+            f"type={self.model_type} | gpus={gpu_ids} | batch_size={batch_size} | "
+            f"path={os.path.basename(model_path)}"
         )
 
     def _load_models(self):
@@ -256,14 +258,24 @@ class InferenceEngine:
                 return True
 
             try:
+                # 优先加载 TensorRT engine
                 engine_path = model_path.replace(".pt", ".engine")
-                actual_path = engine_path if os.path.exists(engine_path) else model_path
+                if os.path.exists(engine_path):
+                    actual_path = engine_path
+                    is_tensorrt = True
+                    logger.info(f"找到 TensorRT engine: {os.path.basename(engine_path)}")
+                else:
+                    # 未找到 .engine，回退到 .pt 模型
+                    actual_path = model_path
+                    is_tensorrt = False
+                    logger.warning(
+                        f"未找到 TensorRT engine ({os.path.basename(engine_path)})，"
+                        f"回退到 PyTorch 模型: {os.path.basename(model_path)}"
+                    )
 
                 if not os.path.exists(actual_path):
                     logger.error(f"模型文件不存在: {actual_path}")
                     return False
-
-                is_tensorrt = actual_path.endswith(".engine")
 
                 classes = []
                 if classes_path and os.path.exists(classes_path):
@@ -281,9 +293,10 @@ class InferenceEngine:
                 )
 
                 self._pools[algorithm_id] = pool
+                pool_type = "TensorRT" if is_tensorrt else "PyTorch"
                 logger.info(
                     f"模型池创建成功 | algorithm_id={algorithm_id} | "
-                    f"tensorrt={is_tensorrt} | gpus={gpu_ids}"
+                    f"type={pool_type} | gpus={gpu_ids}"
                 )
                 return True
 
@@ -315,10 +328,18 @@ class InferenceEngine:
                     conf: float = 0.75, imgsz: int = 640,
                     slice_size: int = 640, overlap_ratio: float = 0.1,
                     iou_threshold: float = 0.5) -> tuple:
-        """SAHI 切片检测 — 多 GPU 并行推理"""
+        """SAHI 切片检测 — 多 GPU 并行推理（非 TensorRT 模型直接回退全图检测）"""
         pool = self._pools.get(algorithm_id)
         if pool is None:
             return [], 0, []
+
+        # PyTorch 模型不做切片推理，直接全图检测
+        if not pool.is_tensorrt:
+            logger.debug(
+                f"detect_sahi 回退全图检测 | algorithm_id={algorithm_id} | "
+                f"model_type=PyTorch"
+            )
+            return self.detect(algorithm_id, frame, conf, imgsz)
 
         h, w = frame.shape[:2]
 

@@ -80,6 +80,8 @@ class StreamWorker:
 
         self.logger = get_task_logger(task_id)
         self.perf_logger = get_performance_logger(task_id)
+        # 模型推理配置（每个算法独立）
+        self._model_inference_sizes = {}   # {alg_id: inference_size} 训练时的 imgsz，作为切片/推理输入大小
         # ByteTrack 追踪器（每个算法独立）
         self._trackers = {}
         self._track_args = TrackArgs(config)
@@ -286,13 +288,18 @@ class StreamWorker:
         if self._skip_counter >= self._detection_interval:
             sahi_config = self.config.get("sahi", {})
             use_sahi = sahi_config.get("enabled", False)
+            # 使用模型训练时的 imgsz（inference_size）作为推理输入大小和切片大小，
+            # 若无配置则默认 640
+            model_imgsz = self._model_inference_sizes.get(
+                alg_id, self.config.get("model", {}).get("imgsz", 640)
+            )
 
             if use_sahi:
                 result = self.inference_engine.detect_sahi(
                     alg_id, frame,
                     conf=self.config.get("model", {}).get("default_conf", 0.75),
-                    imgsz=self.config.get("model", {}).get("imgsz", 640),
-                    slice_size=sahi_config.get("slice_size", 640),
+                    imgsz=model_imgsz,
+                    slice_size=model_imgsz,
                     overlap_ratio=sahi_config.get("overlap_ratio", 0.2),
                     iou_threshold=sahi_config.get("iou_threshold", 0.5),
                 )
@@ -300,7 +307,7 @@ class StreamWorker:
                 result = self.inference_engine.detect(
                     alg_id, frame,
                     conf=self.config.get("model", {}).get("default_conf", 0.75),
-                    imgsz=self.config.get("model", {}).get("imgsz", 640),
+                    imgsz=model_imgsz,
                 )
 
             if isinstance(result, tuple) and len(result) == 3:
@@ -403,6 +410,8 @@ class StreamWorker:
                 if self.orm_helper:
                     model_info = self.orm_helper.get_model_info(alg_id)
                     if model_info:
+                        # 记录模型推理切片大小（训练时的 imgsz），SAHI 切片时使用
+                        self._model_inference_sizes[alg_id] = model_info.inference_size or 640
                         success = self.inference_engine.load_model(
                             alg_id, model_info.model_path, model_info.cls_path
                         )
@@ -459,11 +468,14 @@ class StreamWorker:
             if alg_id not in loaded_models:
                 continue
             try:
+                model_imgsz = self._model_inference_sizes.get(
+                    alg_id, self.config.get("model", {}).get("imgsz", 640)
+                )
                 if use_sahi:
                     self.inference_engine.warmup_detect_with_targets(
                         alg_id,
-                        imgsz=self.config.get("model", {}).get("imgsz", 640),
-                        slice_size=sahi_config.get("slice_size", 640),
+                        imgsz=model_imgsz,
+                        slice_size=model_imgsz,
                         overlap_ratio=sahi_config.get("overlap_ratio", 0.1),
                         iou_threshold=sahi_config.get("iou_threshold", 0.5),
                     )
@@ -473,7 +485,7 @@ class StreamWorker:
                     self.inference_engine.detect(
                         alg_id, warmup_frame,
                         conf=self.config.get("model", {}).get("default_conf", 0.75),
-                        imgsz=self.config.get("model", {}).get("imgsz", 640),
+                        imgsz=model_imgsz,
                     )
                     self.logger.info(f"模型预热完成 | algorithm_id={alg_id}")
             except Exception as e:

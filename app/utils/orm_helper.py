@@ -63,6 +63,7 @@ class ModelInfo(Base):
     model_name = Column(String(255), nullable=False)
     model_path = Column(String(255), nullable=False)
     cls_path = Column(String(255), nullable=False)
+    inference_size = Column(Integer, nullable=False)
 
 
 class TaskRecord(Base):

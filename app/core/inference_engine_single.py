@@ -18,7 +18,7 @@ class InferenceEngine:
         logger.info("推理引擎初始化完成")
 
     def load_model(self, algorithm_id: str, model_path: str, classes_path: str = "") -> bool:
-        """加载模型，优先加载 TensorRT engine"""
+        """加载模型，优先加载 TensorRT engine，未找到时回退到 .pt"""
         with self._lock:
             if algorithm_id in self._models:
                 logger.info(f"模型已加载，跳过 | algorithm_id={algorithm_id}")
@@ -27,14 +27,22 @@ class InferenceEngine:
             try:
                 # 优先加载 TensorRT engine
                 engine_path = model_path.replace(".pt", ".engine")
-                actual_path = engine_path if os.path.exists(engine_path) else model_path
+                if os.path.exists(engine_path):
+                    actual_path = engine_path
+                    is_tensorrt = True
+                    logger.info(f"找到 TensorRT engine: {os.path.basename(engine_path)}")
+                else:
+                    # 未找到 .engine，回退到 .pt 模型
+                    actual_path = model_path
+                    is_tensorrt = False
+                    logger.warning(
+                        f"未找到 TensorRT engine ({os.path.basename(engine_path)})，"
+                        f"回退到 PyTorch 模型: {os.path.basename(model_path)}"
+                    )
 
                 if not os.path.exists(actual_path):
                     logger.error(f"模型文件不存在: {actual_path}")
                     return False
-
-                is_tensorrt = actual_path.endswith(".engine")
-                logger.info(f"加载模型 | algorithm_id={algorithm_id} | path={actual_path} | tensorrt={is_tensorrt}")
 
                 model = YOLO(actual_path)
                 classes = []
@@ -49,7 +57,12 @@ class InferenceEngine:
                     "load_time": time.time(),
                     "is_tensorrt": is_tensorrt,
                 }
-                logger.info(f"模型加载成功 | algorithm_id={algorithm_id} | classes={len(classes)}")
+                model_type = "TensorRT" if is_tensorrt else "PyTorch"
+                logger.info(
+                    f"模型加载成功 | algorithm_id={algorithm_id} | "
+                    f"type={model_type} | path={os.path.basename(actual_path)} | "
+                    f"classes={len(classes)}"
+                )
                 return True
 
             except Exception as e:

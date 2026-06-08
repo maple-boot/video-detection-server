@@ -89,6 +89,10 @@ find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null
 nohup python main.py > /usr/local/nbuav/ai/video-detection-server/logs/app.log 2>&1 &
 ```
 
+``` 复制模型文件到指定目录
+find {model_dir} -mindepth $(find {model_dir} -type f -printf '%d\n' | sort -n | tail -1) \ -type f -exec cp {} /{target_dir} \;
+```
+
 # 测试接口
 curl -v -X POST http://112.14.53.185:6950/stream \
   -H "Content-Type: application/json" \
