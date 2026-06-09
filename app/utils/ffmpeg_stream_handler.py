@@ -127,6 +127,11 @@ class FFmpegGPUStreamHandler:
                     last_frame = np.frombuffer(raw, dtype=np.uint8).reshape((self.height, self.width, 3))
 
                 if last_frame is not None:
+                    # 进程已退出时，缓冲区残留帧视为无效（watchdog 可能在读帧期间杀死了进程）
+                    if self.process and self.process.poll() is not None:
+                        self.logger.warning("进程已退出，丢弃缓冲区残留帧")
+                        self.running = False
+                        return False, None
                     return True, last_frame
                 return False, None
             else:
@@ -134,6 +139,11 @@ class FFmpegGPUStreamHandler:
                 raw = self.process.stdout.read(self.frame_size)
                 if len(raw) < self.frame_size:
                     self.logger.warning(f"读取帧数据不完整 | expected={self.frame_size} | got={len(raw)}")
+                    return False, None
+                # 进程已退出时，缓冲区残留帧视为无效
+                if self.process and self.process.poll() is not None:
+                    self.logger.warning("进程已退出，丢弃缓冲区残留帧")
+                    self.running = False
                     return False, None
                 frame = np.frombuffer(raw, dtype=np.uint8).reshape((self.height, self.width, 3))
                 return True, frame

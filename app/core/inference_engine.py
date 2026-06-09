@@ -1,5 +1,7 @@
 import os
 import time
+import json
+import pickle
 import threading
 import cv2
 import numpy as np
@@ -14,15 +16,47 @@ logger = get_system_logger()
 class ModelPool:
     """算法模型池 — 同一算法共享模型，多 GPU 并行推理"""
 
+    @staticmethod
+    def _read_engine_metadata(engine_path: str) -> dict:
+        """从 TensorRT engine 文件中读取 Ultralytics 元数据（兼容 pickle 和 JSON 格式）"""
+        try:
+            with open(engine_path, "rb") as f:
+                data = f.read()
+            # 优先尝试 pickle 格式（本项目导出脚本使用的格式）
+            magic = b"UlTralYtiCsEnGiNe"
+            idx = data.rfind(magic)
+            if idx >= 0:
+                return pickle.loads(data[idx + len(magic):])
+            # 回退: ultralytics 8.3+ JSON 格式（4字节长度前缀）
+            meta_len = int.from_bytes(data[:4], byteorder="little")
+            return json.loads(data[4:4 + meta_len].decode("utf-8"))
+        except Exception:
+            return {}
+
     def __init__(self, algorithm_id: str, model_path: str,
                  classes: list, gpu_ids: list, batch_size: int = 8):
         self.algorithm_id = algorithm_id
         self.model_path = model_path
         self.classes = classes
         self.gpu_ids = gpu_ids
-        self.batch_size = batch_size
         self.is_tensorrt = model_path.endswith(".engine")
         self.model_type = "TensorRT" if self.is_tensorrt else "PyTorch"
+
+        # 从 engine 元数据读取真实 batch，覆盖配置值
+        if self.is_tensorrt:
+            meta = self._read_engine_metadata(model_path)
+            engine_batch = meta.get("batch")
+            if engine_batch:
+                if engine_batch != batch_size:
+                    logger.info(
+                        f"引擎 batch 覆盖 | algorithm_id={algorithm_id} | "
+                        f"engine_batch={engine_batch} | config_batch={batch_size}"
+                    )
+                self.batch_size = engine_batch
+            else:
+                self.batch_size = batch_size
+        else:
+            self.batch_size = batch_size
 
         self._models = {}
         self._queues = {}
@@ -44,11 +78,10 @@ class ModelPool:
 
             dummy = np.zeros((640, 640, 3), dtype=np.uint8)
             if self.is_tensorrt:
-                for warmup_batch in (1, self.batch_size):
-                    model.predict(
-                        [dummy] * warmup_batch,
-                        device=device, verbose=False, batch=warmup_batch,
-                    )
+                model.predict(
+                    [dummy] * self.batch_size,
+                    device=device, verbose=False, batch=self.batch_size,
+                )
             else:
                 model.predict(dummy, device=device, verbose=False)
 
@@ -129,7 +162,7 @@ class ModelPool:
                 item["event"].set()
 
     def _predict_slices(self, model, slices: list, conf: float, imgsz: int, device: str) -> list:
-        """推理切片 — TensorRT 动态 batch，按实际数量提交，不补 dummy"""
+        """推理切片 — TensorRT 用 engine 真实 batch 填充，PyTorch 按实际数量提交"""
         if not slices:
             return []
         if not self.is_tensorrt:
@@ -139,13 +172,16 @@ class ModelPool:
 
         all_results = []
         for i in range(0, len(slices), self.batch_size):
-            chunk = slices[i:i + self.batch_size]
+            chunk = list(slices[i:i + self.batch_size])
             chunk_batch = len(chunk)
+            # TensorRT engine 为静态 batch，不足时用最后一帧填充
+            if chunk_batch < self.batch_size:
+                chunk += [chunk[-1]] * (self.batch_size - chunk_batch)
             results = model.predict(
                 chunk, conf=conf, imgsz=imgsz,
-                verbose=False, device=device, batch=chunk_batch,
+                verbose=False, device=device, batch=self.batch_size,
             )
-            all_results.extend(results)
+            all_results.extend(results[:chunk_batch])
         return all_results
 
     def infer_parallel(self, slices: list, conf: float = 0.75, imgsz: int = 640) -> tuple:
