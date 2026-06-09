@@ -167,7 +167,8 @@ class FFmpegHelper:
             elapsed = time.time() - t_start
             if elapsed < frame_interval:
                 time.sleep(frame_interval - elapsed)
-            if self._frames_written % 50 == 0:
+            # ★ 仅在有新帧时输出推流统计，避免空闲重发时持续刷日志
+            if idle_cycles == 0 and self._frames_written % 50 == 0:
                 self.logger.info(
                     f"推流统计 | written={self._frames_written} | dropped={self._frames_dropped}"
                 )

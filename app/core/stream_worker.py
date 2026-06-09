@@ -188,7 +188,12 @@ class StreamWorker:
             self._stop_stall_watchdog()
 
             if not success:
-                if self.video_capture.is_live:
+                # ★ 优先检查停止信号，避免重复重连或引用空指针
+                if self._stop_event.is_set():
+                    self._flush_all_tracks()
+                    break
+
+                if self.video_capture and self.video_capture.is_live:
                     self._reconnect_count += 1
                     if self._reconnect_count > self._max_reconnect:
                         self.logger.error(f"超过最大重连次数 {self._max_reconnect}，上报轨迹并结束任务")
@@ -196,7 +201,9 @@ class StreamWorker:
                         raise RuntimeError("直播流重连失败，超过最大重试次数")
 
                     self.logger.warning(f"直播流读取失败，尝试重连 | {self._reconnect_count}/{self._max_reconnect}")
-                    if not self.video_capture.restart():
+                    if self._stop_event.is_set():
+                        break
+                    if not self.video_capture or not self.video_capture.restart():
                         raise RuntimeError("直播流重连失败")
                     if not self._reload_models_if_needed():
                         raise RuntimeError("模型重新加载失败，任务结束")
@@ -227,6 +234,10 @@ class StreamWorker:
             self._skip_counter += 1
             # 重连成功后，重置重连次数
             self._reconnect_count = 0
+
+            # ★ 预热/检测前检查停止信号
+            if self._stop_event.is_set():
+                break
 
             # 预热阶段：跳过检测，直接推原始帧，避免脏数据导致yolo检测全屏结果
             if warmup_frames > 0:
@@ -262,8 +273,11 @@ class StreamWorker:
                     conf_threshold=self.config.get("model", {}).get("default_conf", 0.75),
                 )
 
-                # 推流
-                if not self.ffmpeg_pusher.write_frame(annotated_frame):
+                # ★ 推流前检查停止信号
+                if self._stop_event.is_set():
+                    break
+
+                if not self.ffmpeg_pusher or not self.ffmpeg_pusher.write_frame(annotated_frame):
                     self.logger.warning("推流写帧失败")
                     raise RuntimeError("推流写帧失败")
 
@@ -857,7 +871,7 @@ class StreamWorker:
         self._consecutive_success = 0
 
     def _cleanup(self):
-        """清理资源"""
+        """清理资源（仅供重试时内部调用，外部 stop 请使用 stop()）"""
         if self.video_capture:
             self.video_capture.release()
             self.video_capture = None
@@ -866,10 +880,14 @@ class StreamWorker:
             self.ffmpeg_pusher = None
 
     def stop(self):
-        """停止 Worker"""
+        """停止 Worker — 快速打断主循环，不置空引用避免竞态"""
         self.logger.info("收到停止信号")
         self._stop_event.set()
-        self._cleanup()
+        # ★ 先杀子进程使 read() 立即返回，不置空引用让主循环自然退出
+        if self.video_capture:
+            self.video_capture.release()
+        if self.ffmpeg_pusher:
+            self.ffmpeg_pusher.stop()
         self.state = WorkerState.STOPPED
 
     def get_restart_func(self):
