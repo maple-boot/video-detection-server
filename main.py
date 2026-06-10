@@ -106,7 +106,7 @@ async def lifespan(app: FastAPI):
     logger.info("资源监控初始化完成")
 
     # 初始化 API 模块
-    stream_api.init_stream_api(supervisor, orm_helper)
+    stream_api.init_stream_api(supervisor, orm_helper, config)
     admin_api.init_admin_api(supervisor, cleanup_scheduler, thread_pool, resource_monitor, start_time)
 
     logger.info("=" * 60)

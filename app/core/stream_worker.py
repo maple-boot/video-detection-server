@@ -102,8 +102,8 @@ class StreamWorker:
         self._min_report_frames = self.config.get("tracker", {}).get("min_report_frames", 5)
         # 最大重试次数
         self._max_retry_count = self.config.get("ffmpeg", {}).get("max_retry_count", 5)
-        # 回调上报队列
-        self._report_queue = Queue()
+        # 回调上报队列（限制最大长度 50，防止 OOM）
+        self._report_queue = Queue(maxsize=50)
         self._report_worker = threading.Thread(
             target=self._process_report_queue,
             daemon=True,
@@ -665,13 +665,16 @@ class StreamWorker:
 
 
     def _report_completed_track(self, alg_id, track_data, original_frame, annotated_frame):
-        """放入队列，不阻塞主循环"""
-        self._report_queue.put({
-            "alg_id": alg_id,
-            "track_data": track_data,
-            "original_frame": original_frame.copy(),
-            "annotated_frame": annotated_frame.copy(),
-        })
+        """放入队列，不阻塞主循环（队列满时超时丢弃避免阻塞）"""
+        try:
+            self._report_queue.put({
+                "alg_id": alg_id,
+                "track_data": track_data,
+                "original_frame": original_frame.copy(),
+                "annotated_frame": annotated_frame.copy(),
+            }, timeout=5)
+        except Exception:
+            self.logger.warning("上报队列已满，丢弃轨迹上报")
 
     def _process_report_queue(self):
         """队列消费：逐个处理上报"""
@@ -799,16 +802,19 @@ class StreamWorker:
         self.logger.info("所有剩余轨迹已上报，追踪器已重置")
 
     def _send_callback_sync(self, url: str, payload: dict):
-        """同步发送 HTTP 回调"""
-        try:
-            import requests
-            resp = requests.post(url, json=payload, timeout=5)
-            if resp.status_code != 200:
-                self.logger.warning(f"回调失败 | url={url} | status={resp.status_code}")
-            else:
-                self.logger.debug(f"回调成功 | url={url}")
-        except Exception as e:
-            self.logger.error(f"回调异常: {e}")
+        """同步发送 HTTP 回调（最多重试 3 次，指数退避）"""
+        import requests
+        for attempt in range(3):
+            try:
+                resp = requests.post(url, json=payload, timeout=5)
+                if resp.status_code == 200:
+                    self.logger.debug(f"回调成功 | url={url}")
+                    return
+                self.logger.warning(f"回调失败 | attempt={attempt+1} | status={resp.status_code} | url={url}")
+            except Exception as e:
+                self.logger.warning(f"回调异常 | attempt={attempt+1} | error={e} | url={url}")
+            if attempt < 2:
+                time.sleep(min(2 ** attempt, 5))
 
     def _track(self, alg_id: str, detections: list, frame: np.ndarray, raw_results=None) -> list:
         """ByteTrack 追踪，返回带 track_id 的检测结果"""

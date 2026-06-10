@@ -104,7 +104,16 @@ class StreamSupervisor:
             if worker:
                 worker.stop()
                 del self._workers[task_id]
-                self._worker_threads.pop(task_id, None)
+                thread = self._worker_threads.pop(task_id, None)
+                if thread:
+                    thread.join(timeout=10)
+                # 清理 _task_algorithm_map 中的引用
+                for orig_id, worker_ids in list(self._task_algorithm_map.items()):
+                    if task_id in worker_ids:
+                        worker_ids.remove(task_id)
+                        if not worker_ids:
+                            del self._task_algorithm_map[orig_id]
+                        break
                 logger.info(f"Worker 已停止 | task_id={task_id}")
                 return True
 
@@ -116,7 +125,9 @@ class StreamSupervisor:
                 if worker:
                     worker.stop()
                     del self._workers[worker_id]
-                    self._worker_threads.pop(worker_id, None)
+                    thread = self._worker_threads.pop(worker_id, None)
+                    if thread:
+                        thread.join(timeout=10)
                     logger.info(f"Worker 已停止 | task_id={worker_id}")
                     stopped = True
 

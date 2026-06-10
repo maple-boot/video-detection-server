@@ -12,12 +12,21 @@ router = APIRouter()
 # 全局引用（在 main.py 中注入）
 _supervisor = None
 _orm_helper = None
+_config = None
 
 
-def init_stream_api(supervisor, orm_helper):
-    global _supervisor, _orm_helper
+def _get_push_url_prefix():
+    """从配置中获取推流地址前缀"""
+    if _config:
+        return _config.get("srs", {}).get("push_url_prefix", "rtmp://localhost/live/stream/")
+    return "rtmp://localhost/live/stream/"
+
+
+def init_stream_api(supervisor, orm_helper, config=None):
+    global _supervisor, _orm_helper, _config
     _supervisor = supervisor
     _orm_helper = orm_helper
+    _config = config
 
 
 @router.post("/stream")
@@ -40,7 +49,8 @@ async def start_stream(request: StreamRequest):
                 if existing:
                     # 跳过打印
                     # logger.info(f"任务已存在，跳过 | task_id={task_id} | algorithm_id={alg_id}")
-                    push_url = f"rtmp://112.14.53.185/live/stream/{task_id}_{alg_id}"
+                    push_url_prefix = _get_push_url_prefix()
+                    push_url = f"{push_url_prefix}{task_id}_{alg_id}"
                     return ResponseHelper.success(
                         data={"output_url": push_url.replace('rtmp://', 'webrtc://'), "taskId": task_id}
                     )
@@ -62,16 +72,18 @@ async def start_stream(request: StreamRequest):
             )
             if success:
                 worker_task_id = f"{task_id}_{algorithm_ids}"
-                push_url = f"rtmp://112.14.53.185/live/stream/{worker_task_id}"
+                push_url_prefix = _get_push_url_prefix()
+                push_url = f"{push_url_prefix}{worker_task_id}"
                 return ResponseHelper.success(data={"output_url": push_url.replace('rtmp://', 'webrtc://'), "taskId": task_id})
             else:
                 return ResponseHelper.error("任务启动失败")
         else:
             # 每个算法独立 Worker + 独立推流地址
+            push_url_prefix = _get_push_url_prefix()
             results = []
             for alg_id in algorithm_ids:
                 worker_task_id = f"{task_id}_{alg_id}"
-                push_url = f"rtmp://112.14.53.185/live/stream/{worker_task_id}"
+                push_url = f"{push_url_prefix}{worker_task_id}"
 
                 success = _supervisor.start_stream_worker(
                     task_id=worker_task_id,
@@ -128,7 +140,8 @@ async def get_stream_url(request: StreamUrlRequest):
                 existing = _orm_helper.get_task_record(int(task_id), alg_id)
                 if existing:
                     worker_task_id = f"{task_id}_{alg_id}"
-                    push_url = f"rtmp://112.14.53.185/live/stream/{worker_task_id}"
+                    push_url_prefix = _get_push_url_prefix()
+                    push_url = f"{push_url_prefix}{worker_task_id}"
                     response = ResponseHelper.success(data={"output_url": push_url.replace('rtmp://', 'webrtc://'), "taskId": task_id})
                     logger.info(f"查询到结果 | task_id={task_id} | algorithm_id={alg_id}, 返回：{response}")
                     return ResponseHelper.success(
