@@ -1,3 +1,4 @@
+import math
 import cv2
 import numpy as np
 from app.utils.logger import get_task_logger
@@ -23,6 +24,41 @@ class DetectionUtils:
         union = area1 + area2 - intersection
 
         return intersection / union if union > 0 else 0.0
+
+    @staticmethod
+    def is_valid_box(box: list) -> bool:
+        """检查检测框是否有效（跳过 NaN）"""
+        return not any(math.isnan(v) for v in box)
+
+    @staticmethod
+    def nms_merge(detections: list, iou_threshold: float = 0.5) -> list:
+        """按类别的 NMS 合并，保留置信度最高的框"""
+        if not detections:
+            return []
+
+        class_groups = {}
+        for det in detections:
+            cls_id = det["class_id"]
+            if cls_id not in class_groups:
+                class_groups[cls_id] = []
+            class_groups[cls_id].append(det)
+
+        merged = []
+        for cls_id, dets in class_groups.items():
+            dets.sort(key=lambda x: x["confidence"], reverse=True)
+            keep = []
+            while dets:
+                best = dets.pop(0)
+                keep.append(best)
+                remaining = []
+                for det in dets:
+                    iou = DetectionUtils.calculate_iou(best["bbox"], det["bbox"])
+                    if iou < iou_threshold:
+                        remaining.append(det)
+                dets = remaining
+            merged.extend(keep)
+
+        return merged
 
     @staticmethod
     def calculate_box_ratio(box: list, img_width: int, img_height: int) -> float:

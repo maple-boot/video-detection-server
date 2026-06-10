@@ -1,17 +1,15 @@
 import os
-import math
 import time
 import threading
-import aiohttp
 import cv2
 import numpy as np
 import secrets
 import string
 import torch
+import requests
 import traceback
 from datetime import datetime
 from enum import Enum
-from PIL import ImageFont
 from queue import Queue
 from PIL import Image, ImageDraw, ImageFont
 from app.core.video_capture import VideoCapture
@@ -64,9 +62,6 @@ class StreamWorker:
 
         self.state = WorkerState.IDLE
         self._stop_event = __import__("threading").Event()
-        self._retry_count = 0
-        self._max_retry_interval = 10
-        self._consecutive_success = 0
         self._frame_count = 0
         self._dropped_count = 0
         self._detection_interval = 1
@@ -88,20 +83,15 @@ class StreamWorker:
         # 活跃检测，追踪上报限制
         self._active_tracks = {}
         self._latest_annotated_frames = {}
-        # 直播流重连配置
-        self._max_reconnect = self.config.get("ffmpeg", {}).get("max_reconnect", 10)
-        self._reconnect_count = 0
-        # 流健康监控
+        # 流中断看门狗 — 源流断流超过此秒数直接关闭任务
         self._last_frame_time = time.time()
         self._stream_stall_warned = False
         self._stream_stall_threshold = self.config.get("ffmpeg", {}).get("stream_stall_threshold", 3.0)
-        self._stream_reconnect_threshold = self.config.get("ffmpeg", {}).get("stream_reconnect_threshold", 8.0)
+        self._stream_disconnect_timeout = self.config.get("ffmpeg", {}).get("stream_disconnect_timeout", 10.0)
         self._stall_watchdog = None
         self._stall_watchdog_stop = threading.Event()
         # 连续检测配置
         self._min_report_frames = self.config.get("tracker", {}).get("min_report_frames", 5)
-        # 最大重试次数
-        self._max_retry_count = self.config.get("ffmpeg", {}).get("max_retry_count", 5)
         # 回调上报队列（限制最大长度 50，防止 OOM）
         self._report_queue = Queue(maxsize=50)
         self._report_worker = threading.Thread(
@@ -113,24 +103,39 @@ class StreamWorker:
 
 
     def start(self):
-        """启动 Worker"""
+        """启动 Worker — 单次运行，断流时看门狗直接关闭任务"""
         self.state = WorkerState.INIT
         self.logger.info(
             f"Worker 启动 | stream={self.stream_url} | push={self.push_url} | "
             f"algorithms={self.algorithm_ids}"
         )
 
-        while not self._stop_event.is_set():
-            try:
-                self._run_loop()
-                break
-            except Exception as e:
-                self.logger.error(f"Worker 运行异常: {e}\n{traceback.format_exc()}")
-                if not self._stop_event.is_set():
-                    self._handle_retry()
+        try:
+            self._run_loop()
+        except Exception as e:
+            self.logger.error(f"Worker 运行异常: {e}\n{traceback.format_exc()}")
 
-        # 确保资源释放（视频播放结束/手动停止/重试耗尽后都需要）
-        self._cleanup()
+        # 确保资源释放
+        if self.video_capture:
+            self.video_capture.release()
+            self.video_capture = None
+        if self.ffmpeg_pusher:
+            self.ffmpeg_pusher.stop()
+            self.ffmpeg_pusher = None
+        # 卸载模型池（引用计数 >0 时保留，其他任务仍在使用）
+        for alg_id in self.algorithm_ids:
+            if self.inference_engine:
+                self.inference_engine.unload_model(alg_id)
+        # 软删除任务记录，避免脏数据残留
+        if self.orm_helper:
+            for alg_id in self.algorithm_ids:
+                try:
+                    self.orm_helper.delete_task_record(
+                        task_id=int(self.original_task_id),
+                        algorithm_id=alg_id,
+                    )
+                except Exception as e:
+                    self.logger.error(f"删除任务记录失败 | alg_id={alg_id} | error={e}")
         self.state = WorkerState.STOPPED
         self.logger.info("Worker 已停止")
 
@@ -169,8 +174,6 @@ class StreamWorker:
             raise RuntimeError("模型加载失败，任务结束")
 
         self.state = WorkerState.RUNNING
-        self._retry_count = 0
-        self._consecutive_success = 0
         self.logger.info("Worker 进入运行状态")
 
         # 预热帧数（跳过 FFmpeg 解码器初始化期间的脏数据）
@@ -182,7 +185,7 @@ class StreamWorker:
             t_start = time.time()
 
             # 启动流中断看门狗：read() 是阻塞调用，源流中断时永不返回
-            #   看门狗在超时后杀死 FFmpeg，使 read() 失败并触发现有重连逻辑
+            # 看门狗在超时后杀死 FFmpeg，使 read() 失败并触发现有重连逻辑
             self._start_stall_watchdog()
 
             # 读取最新帧，跳过积压
@@ -192,47 +195,10 @@ class StreamWorker:
             self._stop_stall_watchdog()
 
             if not success:
-                # 优先检查停止信号，避免重复重连或引用空指针
-                if self._stop_event.is_set():
-                    self._flush_all_tracks()
-                    break
-
-                if self.video_capture and self.video_capture.is_live:
-                    self._reconnect_count += 1
-                    if self._reconnect_count > self._max_reconnect:
-                        self.logger.error(f"超过最大重连次数 {self._max_reconnect}，上报轨迹并结束任务")
-                        self._flush_all_tracks()
-                        raise RuntimeError("直播流重连失败，超过最大重试次数")
-
-                    self.logger.warning(f"直播流读取失败，尝试重连 | {self._reconnect_count}/{self._max_reconnect}")
-                    if self._stop_event.is_set():
-                        break
-                    if not self.video_capture or not self.video_capture.restart():
-                        raise RuntimeError("直播流重连失败")
-                    # 重启推流进程，避免旧进程持续推重复帧
-                    if self.ffmpeg_pusher:
-                        self.ffmpeg_pusher.stop()
-                    self.ffmpeg_pusher = FFmpegHelper(
-                        push_url=self.push_url,
-                        width=self.video_capture.width,
-                        height=self.video_capture.height,
-                        fps=25,
-                        task_id=self.task_id,
-                        hwaccel=self.config.get("ffmpeg", {}).get("hwaccel", "cuda"),
-                    )
-                    if not self.ffmpeg_pusher.start():
-                        raise RuntimeError("推流重启失败")
-                    if not self._reload_models_if_needed():
-                        raise RuntimeError("模型重新加载失败，任务结束")
-                    warmup_frames = self.config.get("ffmpeg", {}).get("warmup_frames", 10)
-                    # 使用可中断等待代替 time.sleep，避免幽灵重连
-                    if self._stop_event.wait(2):
-                        break
-                    continue
-                else:
-                    # 视频结束/意外断流，上报所有剩余轨迹；避免出现检测物品未成功上报的问题
-                    self._flush_all_tracks()
-                    break
+                # 看门狗已处理断流（杀解码/推流进程 + _stop_event），或 read() 异常返回
+                # 无论何种原因，直接结束任务
+                self._flush_all_tracks()
+                break
 
             # 流健康监控：检测源流是否长时间无帧
             now = time.time()
@@ -251,9 +217,6 @@ class StreamWorker:
 
             self._frame_count += 1
             self._skip_counter += 1
-            # 重连成功后，重置重连次数
-            self._reconnect_count = 0
-
             # 预热/检测前检查停止信号
             if self._stop_event.is_set():
                 break
@@ -314,7 +277,6 @@ class StreamWorker:
                     f"fps={self.video_capture.fps:.1f} | dropped={self._dropped_count}"
                 )
 
-            self._consecutive_success += 1
 
     def _run_detection(self, alg_id: str, frame: np.ndarray) -> tuple:
         """执行检测（带自适应间隔 + SAHI 切片 + ByteTrack）"""
@@ -462,21 +424,25 @@ class StreamWorker:
         return True
 
     def _start_stall_watchdog(self):
-        """启动流中断看门狗：超时后打断阻塞的 read()，触发现有重连逻辑"""
+        """启动流中断看门狗：超过 timeout 秒无帧则关闭任务全部资源"""
         self._stall_watchdog_stop.clear()
-        threshold = self._stream_reconnect_threshold
+        threshold = self._stream_disconnect_timeout
 
         def watchdog():
             if self._stall_watchdog_stop.wait(timeout=threshold):
-                return  # 正常返回，无需处理
-            # 超时：源流中断，关闭管道 + 杀死 FFmpeg 解码进程
-            # 不调 restart()——由主循环的统一重连逻辑处理
+                return  # read() 正常返回，取消看门狗
+            # 超时：源流断流超过阈值，直接关闭任务所有关联资源
             self.logger.warning(
-                f"源流中断超过 {threshold}s，看门狗正在终止 FFmpeg 解码进程 | "
-                f"reconnect_count={self._reconnect_count}/{self._max_reconnect}"
+                f"源流中断超过 {threshold}s，关闭任务 | task_id={self.task_id}"
             )
+            # 杀解码进程 → 使 read() 返回失败
             if self.video_capture and self.video_capture._ffmpeg_handler:
                 self.video_capture._ffmpeg_handler.stop()
+            # 杀推流进程
+            if self.ffmpeg_pusher:
+                self.ffmpeg_pusher.stop()
+            # 通知主循环终止
+            self._stop_event.set()
 
         self._stall_watchdog = threading.Thread(
             target=watchdog, daemon=True,
@@ -540,7 +506,7 @@ class StreamWorker:
                 continue
             box = det["bbox"]
             # 跳过包含 NaN 的无效检测框
-            if any(math.isnan(v) for v in box):
+            if not DetectionUtils.is_valid_box(box):
                 continue
             x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
             track_id = det.get("track_id", 0)
@@ -803,7 +769,6 @@ class StreamWorker:
 
     def _send_callback_sync(self, url: str, payload: dict):
         """同步发送 HTTP 回调（最多重试 3 次，指数退避）"""
-        import requests
         for attempt in range(3):
             try:
                 resp = requests.post(url, json=payload, timeout=5)
@@ -876,44 +841,6 @@ class StreamWorker:
         return colors[track_id % len(colors)]
 
 
-    def _handle_retry(self):
-        """处理重试逻辑（带最大重试次数保护）"""
-        self.state = WorkerState.RETRYING
-        self._retry_count += 1
-
-        # 检查最大重试次数
-        if self._retry_count > self._max_retry_count:
-            self.logger.error(
-                f"超过最大重试次数 {self._max_retry_count}，停止重试 | "
-                f"已重试 {self._retry_count - 1} 次"
-            )
-            self._cleanup()
-            self._stop_event.set()  # 终止主循环
-            return
-
-        # 指数退避
-        wait_time = min(2 ** (self._retry_count - 1), self._max_retry_interval)
-        self.logger.info(f"重试等待 | retry={self._retry_count} | wait={wait_time}s | max={self._max_retry_count}")
-        self._stop_event.wait(wait_time)
-
-        # 清理资源
-        self._cleanup()
-
-        for alg_id in self.algorithm_ids:
-            self._trackers[alg_id] = BYTETracker(args=self._track_args, frame_rate=25)
-            self.logger.info(f"ByteTrack 追踪器已重置 | algorithm_id={alg_id}")
-
-        self._consecutive_success = 0
-
-    def _cleanup(self):
-        """清理资源（仅供重试时内部调用，外部 stop 请使用 stop()）"""
-        if self.video_capture:
-            self.video_capture.release()
-            self.video_capture = None
-        if self.ffmpeg_pusher:
-            self.ffmpeg_pusher.stop()  # stop() 内部会确保杀掉进程
-            self.ffmpeg_pusher = None
-
     def stop(self):
         """停止 Worker — 快速打断主循环，不置空引用避免竞态"""
         self.logger.info("收到停止信号")
@@ -929,7 +856,6 @@ class StreamWorker:
         """获取重启函数（供清理调度器使用）"""
         def restart():
             self._stop_event.clear()
-            self._retry_count = 0
             self._frame_count = 0
             self.state = WorkerState.IDLE
             self.start()

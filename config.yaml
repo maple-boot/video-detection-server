@@ -55,7 +55,7 @@ ffmpeg:
   warmup_frames: 30
   max_reconnect: 10
   stream_stall_threshold: 2.0       # 源流无帧超过此秒数即记录中断告警
-  stream_reconnect_threshold: 4.0   # 源流中断超过此秒数，看门狗强制重启解码进程
+  stream_disconnect_timeout: 10.0   # 源流断流超过此秒数，看门狗直接关闭任务
 
 model:
   default_conf: 0.75

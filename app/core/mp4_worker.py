@@ -1,5 +1,4 @@
 import os
-import math
 import time
 import cv2
 import numpy as np
@@ -127,7 +126,7 @@ class MP4Worker:
         for det in detections:
             box = det["bbox"]
             # 跳过包含 NaN 的无效检测框
-            if any(math.isnan(v) for v in box):
+            if not DetectionUtils.is_valid_box(box):
                 continue
             x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)

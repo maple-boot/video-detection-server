@@ -9,6 +9,7 @@ from queue import Queue
 from ultralytics import YOLO
 from app.utils.gpu_allocator import resolve_gpu_roles, select_parallel_gpu_count
 from app.utils.logger import get_task_logger, get_system_logger
+from app.utils.detection_util import DetectionUtils
 
 logger = get_system_logger()
 
@@ -74,6 +75,10 @@ class ModelPool:
         """在每个 GPU 上加载模型"""
         for gpu_id in self.gpu_ids:
             device = str(gpu_id)
+            # 创建 YOLO 前先切换到目标 GPU，确保 TensorRT ExecutionContext 创建在正确的 GPU 上
+            if self.is_tensorrt:
+                import torch
+                torch.cuda.set_device(gpu_id)
             model = YOLO(self.model_path)
 
             dummy = np.zeros((640, 640, 3), dtype=np.uint8)
@@ -273,6 +278,7 @@ class InferenceEngine:
     def __init__(self, config: dict):
         self.config = config
         self._pools = {}
+        self._pool_refcount = {}  # algorithm_id -> 引用计数，跨任务共享保护
         self._lock = threading.Lock()
 
         roles = resolve_gpu_roles(config)
@@ -290,7 +296,11 @@ class InferenceEngine:
     def load_model(self, algorithm_id: str, model_path: str, classes_path: str = "") -> bool:
         with self._lock:
             if algorithm_id in self._pools:
-                logger.info(f"模型池已存在 | algorithm_id={algorithm_id}")
+                self._pool_refcount[algorithm_id] += 1
+                logger.info(
+                    f"模型池引用 +1 | algorithm_id={algorithm_id} | "
+                    f"refcount={self._pool_refcount[algorithm_id]}"
+                )
                 return True
 
             try:
@@ -329,6 +339,7 @@ class InferenceEngine:
                 )
 
                 self._pools[algorithm_id] = pool
+                self._pool_refcount[algorithm_id] = 1
                 pool_type = "TensorRT" if is_tensorrt else "PyTorch"
                 logger.info(
                     f"模型池创建成功 | algorithm_id={algorithm_id} | "
@@ -423,7 +434,7 @@ class InferenceEngine:
                     "class_name": class_name,
                 })
 
-        merged = self._nms_merge(all_detections, iou_threshold)
+        merged = DetectionUtils.nms_merge(all_detections, iou_threshold)
 
         # logger.info(
         #     f"SAHI 切片检测 | algorithm_id={algorithm_id} | "
@@ -518,57 +529,21 @@ class InferenceEngine:
                 })
         return detections
 
-    @staticmethod
-    def _nms_merge(detections: list, iou_threshold: float = 0.5) -> list:
-        if not detections:
-            return []
-
-        class_groups = {}
-        for det in detections:
-            cls_id = det["class_id"]
-            if cls_id not in class_groups:
-                class_groups[cls_id] = []
-            class_groups[cls_id].append(det)
-
-        merged = []
-        for cls_id, dets in class_groups.items():
-            dets.sort(key=lambda x: x["confidence"], reverse=True)
-            keep = []
-            while dets:
-                best = dets.pop(0)
-                keep.append(best)
-                remaining = []
-                for det in dets:
-                    iou = InferenceEngine._calculate_iou(best["bbox"], det["bbox"])
-                    if iou < iou_threshold:
-                        remaining.append(det)
-                dets = remaining
-            merged.extend(keep)
-
-        return merged
-
-    @staticmethod
-    def _calculate_iou(box1: list, box2: list) -> float:
-        x1 = max(box1[0], box2[0])
-        y1 = max(box1[1], box2[1])
-        x2 = min(box1[2], box2[2])
-        y2 = min(box1[3], box2[3])
-
-        inter_area = max(0, x2 - x1) * max(0, y2 - y1)
-        if inter_area == 0:
-            return 0.0
-
-        box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
-        box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
-
-        return inter_area / (box1_area + box2_area - inter_area)
-
     def unload_model(self, algorithm_id: str):
         with self._lock:
-            if algorithm_id in self._pools:
-                self._pools[algorithm_id].unload()
-                del self._pools[algorithm_id]
-                logger.info(f"模型池已卸载 | algorithm_id={algorithm_id}")
+            if algorithm_id not in self._pools:
+                return
+            self._pool_refcount[algorithm_id] -= 1
+            if self._pool_refcount[algorithm_id] > 0:
+                logger.info(
+                    f"模型池引用 -1，保留 | algorithm_id={algorithm_id} | "
+                    f"refcount={self._pool_refcount[algorithm_id]}"
+                )
+                return
+            self._pools[algorithm_id].unload()
+            del self._pools[algorithm_id]
+            del self._pool_refcount[algorithm_id]
+            logger.info(f"模型池已卸载 | algorithm_id={algorithm_id}")
 
     def get_loaded_models(self) -> list:
         return list(self._pools.keys())
@@ -578,6 +553,7 @@ class InferenceEngine:
             for pool in self._pools.values():
                 pool.unload()
             self._pools.clear()
+            self._pool_refcount.clear()
             try:
                 import torch
                 if torch.cuda.is_available():
