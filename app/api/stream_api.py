@@ -160,6 +160,13 @@ async def stop_stream(request: StopTaskRequest):
         if not success:
             return ResponseHelper.not_found(f"任务不存在或已停止: {worker_task_id}")
 
+        # 停止成功后删除对应的数据库记录
+        if _orm_helper:
+            try:
+                _orm_helper.delete_task_record(int(task_id), algorithm_id)
+            except Exception as e:
+                logger.error(f"删除任务记录异常 | task_id={task_id} | algorithm_id={algorithm_id} | error={e}")
+
         logger.info(f"任务已停止 | task_id={task_id} | algorithm_id={algorithm_id}")
         return ResponseHelper.success(message="任务已停止")
 

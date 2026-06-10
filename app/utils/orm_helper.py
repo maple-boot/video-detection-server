@@ -275,7 +275,7 @@ class ORMHelper:
         try:
             return (
                 session.query(TaskRecord)
-                .filter_by(task_id=task_id, algorithm_id=algorithm_id)
+                .filter_by(task_id=task_id, algorithm_id=algorithm_id, is_deleted=0)
                 .order_by(TaskRecord.create_time.desc())
                 .first()
             )
@@ -291,7 +291,7 @@ class ORMHelper:
         session = self.get_session()
         try:
             existing_record = session.query(TaskRecord).filter_by(
-                task_id=task_id, algorithm_id=algorithm_id
+                task_id=task_id, algorithm_id=algorithm_id, is_deleted=0
             ).first()
             if existing_record:
                 return existing_record
@@ -315,13 +315,37 @@ class ORMHelper:
         finally:
             session.close()
 
-    def update_task_status(self, task_id, algorithm_id, status, output_url=None, remark=None):
-        """更新任务状态。按创建时间倒序取最新一条记录进行更新。"""
+    def delete_task_record(self, task_id: int, algorithm_id: str):
+        """软删除任务记录（将 is_deleted 标记为 1）。"""
         session = self.get_session()
         try:
             record = (
                 session.query(TaskRecord)
                 .filter_by(task_id=task_id, algorithm_id=algorithm_id)
+                .order_by(TaskRecord.create_time.desc())
+                .first()
+            )
+            if record:
+                record.is_deleted = 1
+                session.commit()
+                logger.info(f"任务记录已删除 | task_id={task_id} | algorithm_id={algorithm_id}")
+                return True
+            logger.warning(f"任务记录不存在，跳过删除 | task_id={task_id} | algorithm_id={algorithm_id}")
+            return False
+        except SQLAlchemyError as e:
+            session.rollback()
+            logger.error(f"删除任务记录失败 | task_id={task_id} | algorithm_id={algorithm_id} | error={e}")
+            raise e
+        finally:
+            session.close()
+
+    def update_task_status(self, task_id, algorithm_id, status, output_url=None, remark=None):
+        """更新任务状态。按创建时间倒序取最新一条记录进行更新（排除已删除记录）。"""
+        session = self.get_session()
+        try:
+            record = (
+                session.query(TaskRecord)
+                .filter_by(task_id=task_id, algorithm_id=algorithm_id, is_deleted=0)
                 .order_by(TaskRecord.create_time.desc())
                 .first()
             )
