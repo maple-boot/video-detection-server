@@ -4,11 +4,12 @@ import json
 import pickle
 import threading
 import cv2
+import torch
 import numpy as np
 from queue import Queue
 from ultralytics import YOLO
 from app.utils.gpu_allocator import resolve_gpu_roles, select_parallel_gpu_count
-from app.utils.logger import get_task_logger, get_system_logger
+from app.utils.logger import get_task_logger, get_system_logger, get_memory_logger
 from app.utils.detection_util import DetectionUtils
 
 logger = get_system_logger()
@@ -23,19 +24,20 @@ class ModelPool:
         try:
             with open(engine_path, "rb") as f:
                 data = f.read()
-            # 优先尝试 pickle 格式（本项目导出脚本使用的格式）
+            # 优先尝试 pickle 格式
             magic = b"UlTralYtiCsEnGiNe"
             idx = data.rfind(magic)
             if idx >= 0:
                 return pickle.loads(data[idx + len(magic):])
-            # 回退: ultralytics 8.3+ JSON 格式（4字节长度前缀）
+            # 回退: ultralytics 8.3+ JSON 格式
             meta_len = int.from_bytes(data[:4], byteorder="little")
             return json.loads(data[4:4 + meta_len].decode("utf-8"))
         except Exception:
             return {}
 
     def __init__(self, algorithm_id: str, model_path: str,
-                 classes: list, gpu_ids: list, batch_size: int = 8):
+                 classes: list, gpu_ids: list, batch_size: int = 8,
+                 eviction_callback=None):
         self.algorithm_id = algorithm_id
         self.model_path = model_path
         self.classes = classes
@@ -43,55 +45,166 @@ class ModelPool:
         self.is_tensorrt = model_path.endswith(".engine")
         self.model_type = "TensorRT" if self.is_tensorrt else "PyTorch"
 
-        # 从 engine 元数据读取真实 batch，覆盖配置值
-        if self.is_tensorrt:
-            meta = self._read_engine_metadata(model_path)
-            engine_batch = meta.get("batch")
-            if engine_batch:
-                if engine_batch != batch_size:
-                    logger.info(
-                        f"引擎 batch 覆盖 | algorithm_id={algorithm_id} | "
-                        f"engine_batch={engine_batch} | config_batch={batch_size}"
-                    )
-                self.batch_size = engine_batch
-            else:
-                self.batch_size = batch_size
-        else:
-            self.batch_size = batch_size
+        # batch_size 先用配置值，TensorRT 引擎加载后从 TRT profile 提取真实值覆盖
+        self.batch_size = batch_size
 
         self._models = {}
         self._queues = {}
         self._workers = []
+        self._eviction_callback = eviction_callback
         self._load_models()
         self._start_workers()
 
         logger.info(
             f"模型池创建 | algorithm_id={algorithm_id} | "
-            f"type={self.model_type} | gpus={gpu_ids} | batch_size={batch_size} | "
+            f"type={self.model_type} | gpus={self.gpu_ids} | batch_size={batch_size} | "
             f"path={os.path.basename(model_path)}"
         )
 
     def _load_models(self):
-        """在每个 GPU 上加载模型"""
-        for gpu_id in self.gpu_ids:
-            device = str(gpu_id)
-            # 创建 YOLO 前先切换到目标 GPU，确保 TensorRT ExecutionContext 创建在正确的 GPU 上
-            if self.is_tensorrt:
-                import torch
-                torch.cuda.set_device(gpu_id)
-            model = YOLO(self.model_path)
+        """在每个 GPU 上并行加载模型（独立线程 + CUDA 设备绑定 + 显存预检 + OOM 驱逐回退）"""
+        import torch
 
-            dummy = np.zeros((640, 640, 3), dtype=np.uint8)
-            if self.is_tensorrt:
-                model.predict(
-                    [dummy] * self.batch_size,
-                    device=device, verbose=False, batch=self.batch_size,
+        # 根据 engine 文件大小动态估算显存需求
+        if self.is_tensorrt:
+            engine_size_mb = os.path.getsize(self.model_path) / (1 << 20)
+            estimated_mib = max(engine_size_mb * 300, 4096)
+            min_free_bytes = int(estimated_mib * (1 << 20))
+            logger.info(
+                f"动态显存阈值 | engine_size={engine_size_mb:.0f}MiB | "
+                f"threshold={estimated_mib/1024:.1f}GiB"
+            )
+        else:
+            min_free_bytes = 4 * (1 << 30)
+
+        def _check_gpu(gpu_id):
+            free_bytes, total_bytes = torch.cuda.mem_get_info(gpu_id)
+            free_gb = free_bytes / (1 << 30)
+            total_gb = total_bytes / (1 << 30)
+            if free_bytes < min_free_bytes:
+                logger.warning(
+                    f"GPU {gpu_id} 显存不足 | free={free_gb:.1f}GiB / total={total_gb:.1f}GiB"
                 )
-            else:
-                model.predict(dummy, device=device, verbose=False)
+                return False
+            logger.info(f"GPU {gpu_id} 显存充足 | free={free_gb:.1f}GiB / total={total_gb:.1f}GiB")
+            return True
 
-            self._models[gpu_id] = model
-            logger.info(f"模型加载 | algorithm_id={self.algorithm_id} | gpu={gpu_id} | path={self.model_path}")
+        # 显存预检，跳过不足的 GPU
+        candidates = [g for g in self.gpu_ids if _check_gpu(g)]
+
+        # 如果无候选 GPU，尝试驱逐重复模型腾出空间
+        if not candidates and self._eviction_callback:
+            for gpu_id in self.gpu_ids:
+                if self._eviction_callback(gpu_id):
+                    torch.cuda.empty_cache()
+                    # 重新检查显存
+                    if _check_gpu(gpu_id):
+                        candidates.append(gpu_id)
+                        logger.info(f"GPU {gpu_id} 通过驱逐释放显存，加入候选")
+                        break
+
+        if not candidates:
+            raise RuntimeError(
+                f"所有推理 GPU 显存均不足 {min_free_bytes >> 30}GiB，且无法通过驱逐释放"
+            )
+
+        # 并行加载模型到候选 GPU
+        loaded = {}
+        errors = []
+        lock = threading.Lock()
+        loaded_event = threading.Event()
+        _batch_extracted = threading.Event()
+
+        def _load_on_gpu(gpu_id: int):
+            nonlocal _batch_extracted
+            try:
+                torch.cuda.set_device(gpu_id)
+                model = YOLO(self.model_path)
+
+                # 从 TRT engine profile 提取 batch，替代预读元数据
+                if self.is_tensorrt and not _batch_extracted.is_set():
+                    try:
+                        trt_engine = model.engine.engine  # ICudaEngine
+                        input_name = trt_engine.get_tensor_name(0)
+                        # profile 0 返回 (min_shape, opt_shape, max_shape)
+                        opt_shape = trt_engine.get_tensor_profile_shape(input_name, 0)[1]
+                        engine_batch = opt_shape[0]
+                        if engine_batch != self.batch_size:
+                            logger.info(
+                                f"引擎 batch 覆盖 | algorithm_id={self.algorithm_id} | "
+                                f"engine_batch={engine_batch} | config_batch={self.batch_size}"
+                            )
+                            self.batch_size = engine_batch
+                    except Exception as e:
+                        logger.warning(
+                            f"无法从 engine 提取 batch | algorithm_id={self.algorithm_id} | "
+                            f"error={e}"
+                        )
+                    _batch_extracted.set()
+
+                dummy = np.zeros((640, 640, 3), dtype=np.uint8)
+                if self.is_tensorrt:
+                    model.predict(
+                        [dummy] * self.batch_size,
+                        verbose=False, batch=self.batch_size,
+                    )
+                else:
+                    model.predict(dummy, verbose=False)
+
+                # Warmup 后清理推理临时 buffer，保留模型权重常驻
+                if self.is_tensorrt:
+                    torch.cuda.empty_cache()
+
+                with lock:
+                    loaded[gpu_id] = model
+                loaded_event.set()
+                logger.info(f"模型加载成功 | algorithm_id={self.algorithm_id} | gpu={gpu_id}")
+            except Exception as e:
+                with lock:
+                    errors.append((gpu_id, e))
+                logger.error(f"模型加载失败 | algorithm_id={self.algorithm_id} | gpu={gpu_id} | error={e}")
+
+        threads = []
+        for gpu_id in candidates:
+            t = threading.Thread(target=_load_on_gpu, args=(gpu_id,), daemon=True)
+            t.start()
+            threads.append(t)
+
+        for t in threads:
+            t.join(timeout=180)
+
+        if not loaded:
+            raise RuntimeError(f"所有候选 GPU 加载均失败: {errors}")
+
+        if errors:
+            logger.warning(
+                f"部分 GPU 加载失败，降级运行 | "
+                f"成功={list(loaded.keys())} | 失败={[e[0] for e in errors]}"
+            )
+
+        self.gpu_ids = list(loaded.keys())
+        self._models = loaded
+
+        # ── 记录每个 GPU 加载完成后的显存占用 ──
+        mem_logger = get_memory_logger()
+        for gpu_id in self.gpu_ids:
+            try:
+                free_bytes, total_bytes = torch.cuda.mem_get_info(gpu_id)
+                used_bytes = total_bytes - free_bytes
+                used_gib = used_bytes / (1 << 30)
+                total_gib = total_bytes / (1 << 30)
+                pct = used_bytes / total_bytes * 100
+                mem_logger.info(
+                    f"模型加载后显存 | algorithm_id={self.algorithm_id} | "
+                    f"gpu={gpu_id} | type={self.model_type} | "
+                    f"used={used_gib:.2f}GiB / {total_gib:.2f}GiB ({pct:.1f}%) | "
+                    f"model={os.path.basename(self.model_path)}"
+                )
+            except Exception as e:
+                mem_logger.warning(
+                    f"获取显存信息失败 | algorithm_id={self.algorithm_id} | "
+                    f"gpu={gpu_id} | error={e}"
+                )
 
     def _start_workers(self):
         """每个 GPU 启动一个推理工作线程"""
@@ -110,6 +223,8 @@ class ModelPool:
 
     def _inference_loop(self, gpu_id: int, queue: Queue):
         """GPU 推理工作线程 — 从队列取任务，串行执行"""
+        # 工作线程固定到对应 GPU，确保 TRT 上下文和推理在同一设备
+        torch.cuda.set_device(gpu_id)
         model = self._models[gpu_id]
         device = str(gpu_id)
         task_count = 0
@@ -130,9 +245,11 @@ class ModelPool:
                 batch_n = len(slices)
                 t0 = time.time()
 
-                result_holder["results"] = self._predict_slices(
-                    model, slices, conf, imgsz, device,
-                )
+                # 推理时也确保设备上下文正确
+                with torch.cuda.device(gpu_id):
+                    result_holder["results"] = self._predict_slices(
+                        model, slices, conf, imgsz, device,
+                    )
 
                 infer_time_ms = (time.time() - t0) * 1000
                 result_holder["time"] = infer_time_ms
@@ -182,9 +299,10 @@ class ModelPool:
             # TensorRT engine 为静态 batch，不足时用最后一帧填充
             if chunk_batch < self.batch_size:
                 chunk += [chunk[-1]] * (self.batch_size - chunk_batch)
+            # 不传 device= 参数，设备由调用方（_inference_loop）的 torch.cuda.device() 上下文管理
             results = model.predict(
                 chunk, conf=conf, imgsz=imgsz,
-                verbose=False, device=device, batch=self.batch_size,
+                verbose=False, batch=self.batch_size,
             )
             all_results.extend(results[:chunk_batch])
         return all_results
@@ -264,12 +382,25 @@ class ModelPool:
         return holder["results"], holder["time"]
 
     def unload(self):
-        """卸载模型池"""
-        for gpu_id in self.gpu_ids:
+        """卸载模型池（所有 GPU）"""
+        for gpu_id in list(self.gpu_ids):
             self._queues[gpu_id].put(None)
             if gpu_id in self._models:
                 del self._models[gpu_id]
+        self._models.clear()
+        self.gpu_ids.clear()
         logger.info(f"模型池卸载 | algorithm_id={self.algorithm_id}")
+
+    def unload_gpu(self, gpu_id: int):
+        """从指定 GPU 卸载模型，保留其他 GPU 的副本供继续推理"""
+        if gpu_id not in self.gpu_ids:
+            return
+        self._queues[gpu_id].put(None)
+        if gpu_id in self._models:
+            del self._models[gpu_id]
+        self._queues.pop(gpu_id, None)
+        self.gpu_ids.remove(gpu_id)
+        logger.info(f"GPU {gpu_id} 模型卸载 | algorithm_id={self.algorithm_id} | 剩余 GPU={self.gpu_ids}")
 
 
 class InferenceEngine:
@@ -293,6 +424,27 @@ class InferenceEngine:
             f"batch_size={self._batch_size} | 多卡阈值={self._batch_size}×卡数"
         )
 
+    def _evict_gpu(self, gpu_id: int) -> bool:
+        """
+        在指定 GPU 上寻找可驱逐的模型池并卸载（仅卸载该 GPU 的副本）。
+        条件：该模型池在其他 GPU 上仍有副本，卸载后不影响推理。
+        """
+        with self._lock:
+            for alg_id, pool in list(self._pools.items()):
+                if gpu_id not in pool.gpu_ids:
+                    continue
+                if len(pool.gpu_ids) <= 1:
+                    # 该池只有这张 GPU 有模型，不能驱逐（否则完全不可用）
+                    continue
+                pool.unload_gpu(gpu_id)
+                logger.warning(
+                    f"驱逐 GPU {gpu_id} 上的模型 | algorithm_id={alg_id} | "
+                    f"该池剩余 GPU={pool.gpu_ids}"
+                )
+                return True
+            logger.warning(f"GPU {gpu_id} 上无符合驱逐条件的模型池")
+            return False
+
     def load_model(self, algorithm_id: str, model_path: str, classes_path: str = "") -> bool:
         with self._lock:
             if algorithm_id in self._pools:
@@ -304,8 +456,8 @@ class InferenceEngine:
                 return True
 
             try:
-                # 优先加载 TensorRT engine
-                engine_path = model_path.replace(".pt", ".engine")
+                # [优化4] 优先加载 TensorRT engine（用 rsplit 避免路径中含 .pt 时的错误替换）
+                engine_path = model_path.rsplit(".pt", 1)[0] + ".engine"
                 if os.path.exists(engine_path):
                     actual_path = engine_path
                     is_tensorrt = True
@@ -330,12 +482,14 @@ class InferenceEngine:
 
                 gpu_ids = list(self._inference_gpu_ids)
 
+                # 传入驱逐回调，当 GPU 显存不足时自动释放其他池的重复副本
                 pool = ModelPool(
                     algorithm_id=algorithm_id,
                     model_path=actual_path,
                     classes=classes,
                     gpu_ids=gpu_ids,
                     batch_size=self._batch_size,
+                    eviction_callback=self._evict_gpu,
                 )
 
                 self._pools[algorithm_id] = pool
@@ -345,6 +499,25 @@ class InferenceEngine:
                     f"模型池创建成功 | algorithm_id={algorithm_id} | "
                     f"type={pool_type} | gpus={gpu_ids}"
                 )
+
+                # ── 记录加载后所有推理 GPU 的全局显存快照 ──
+                mem_logger = get_memory_logger()
+                for gid in self._inference_gpu_ids:
+                    try:
+                        free_b, total_b = torch.cuda.mem_get_info(gid)
+                        used_b = total_b - free_b
+                        used_gi = used_b / (1 << 30)
+                        total_gi = total_b / (1 << 30)
+                        pct = used_b / total_b * 100
+                        mem_logger.info(
+                            f"推理引擎全局显存 | algorithm_id={algorithm_id} | "
+                            f"gpu={gid} | used={used_gi:.2f}GiB / {total_gi:.2f}GiB ({pct:.1f}%)"
+                        )
+                    except Exception as e:
+                        mem_logger.warning(
+                            f"获取推理 GPU 显存失败 | algorithm_id={algorithm_id} | "
+                            f"gpu={gid} | error={e}"
+                        )
                 return True
 
             except Exception as e:

@@ -5,7 +5,7 @@
 import argparse
 import os
 import time
-import pickle
+import json
 import onnx
 import tensorrt as trt
 from ultralytics import YOLO
@@ -48,14 +48,31 @@ def _extract_ultralytics_metadata(pt_path: str, imgsz: int, max_batch: int):
     except Exception:
         names = {}
 
-    # 获取 stride
+    # 获取 stride（确保是 int，YOLO.predict 内部会做 int(stride)）
     stride = 32
     try:
         if hasattr(model, "model") and hasattr(model.model, "stride"):
             s = model.model.stride
-            stride = s.tolist() if hasattr(s, "tolist") else (s.cpu().numpy().tolist() if hasattr(s, "cpu") else int(s))
+            if hasattr(s, "tolist"):
+                stride = s.tolist()
+            elif hasattr(s, "cpu"):
+                stride = s.cpu().numpy().tolist()
+            else:
+                stride = int(s)
+            # stride 可能是 [32] 或 32，统一为 int
+            stride = int(stride[0]) if isinstance(stride, (list, tuple)) else int(stride)
     except Exception:
         stride = 32
+
+    # 获取任务类型（detect / segment / pose 等）
+    task_type = getattr(model, "task", "detect")
+
+    # 记录构建时的 TRT 版本（用于后续加载时诊断版本不匹配）
+    try:
+        import tensorrt as _trt_ver
+        trt_version = _trt_ver.__version__
+    except Exception:
+        trt_version = "unknown"
 
     metadata = {
         "names": names,
@@ -63,18 +80,26 @@ def _extract_ultralytics_metadata(pt_path: str, imgsz: int, max_batch: int):
         "batch": max_batch,
         "imgsz": (imgsz, imgsz),
         "pt": True,
+        "task": task_type,
+        "trt_version": trt_version,
     }
     return metadata
 
 
 def _embed_metadata_to_engine(engine_path: str, metadata: dict):
-    """将 Ultralytics 元数据追加到 engine 文件末尾（与 Ultralytics 格式一致）"""
-    # Ultralytics 使用 b'UlTralYtiCsEnGiNe' 作为分隔符
-    magic = b"UlTralYtiCsEnGiNe"
-    data = pickle.dumps(metadata)
-    with open(engine_path, "ab") as f:
-        f.write(magic)
-        f.write(data)
+    """用 Ultralytics 原生格式嵌入元数据（4字节长度前缀 + JSON + TRT引擎数据）"""
+    meta_json = json.dumps(metadata).encode("utf-8")
+    meta_len = len(meta_json)
+
+    # 读取已保存的 TRT 引擎数据
+    with open(engine_path, "rb") as f:
+        trt_data = f.read()
+
+    # 以 Ultralytics 原生格式重写：[4字节长度][JSON元数据][TRT引擎]
+    with open(engine_path, "wb") as f:
+        f.write(meta_len.to_bytes(4, byteorder="little"))
+        f.write(meta_json)
+        f.write(trt_data)
 def _fix_onnx_spatial_dims(onnx_path: str, imgsz: int):
     """
     将 ONNX 中 input 'images' 的 H, W 维度从动态改为固定值 imgsz。
@@ -90,6 +115,19 @@ def _fix_onnx_spatial_dims(onnx_path: str, imgsz: int):
     onnx.save(model, onnx_path)
 
 
+def _set_memory_pool(config, workspace_gb: int):
+    """
+    设置 builder 内存池。
+    TRT 10.x cu12 绑定中 WORKSPACE 仍然有效。
+    """
+    mem_bytes = workspace_gb * (1 << 30)
+    try:
+        config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, mem_bytes)
+        print(f"TRT: 设置内存池 = {workspace_gb} GiB")
+    except (AttributeError, Exception) as e:
+        print(f"TRT: 无法设置内存池 ({e})，使用默认值")
+
+
 def _build_trt_engine(
     onnx_path: str,
     engine_path: str,
@@ -103,6 +141,7 @@ def _build_trt_engine(
     使用显式优化轮廓固定空间维度、仅 batch 动态。
     """
     logger = trt.Logger(trt.Logger.INFO)
+    print(f"TRT 版本: {trt.__version__}")
     builder = trt.Builder(logger)
     network = _create_trt_network(builder)
     parser = trt.OnnxParser(network, logger)
@@ -129,7 +168,7 @@ def _build_trt_engine(
 
     config = builder.create_builder_config()
     config.add_optimization_profile(profile)
-    config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_gb * (1 << 30))
+    _set_memory_pool(config, workspace_gb)
 
     if enable_fp16:
         try:
@@ -165,10 +204,11 @@ def export_engine(pt_path: str, max_batch: int, imgsz: int, device: int,
     filename = os.path.basename(pt_path)
     t0 = time.time()
 
-    # ---- 第 1 步：导出 ONNX（全部维度动态） ----
+    # ---- 第 1 步：导出 ONNX（batch 动态，空间固定） ----
     print(f"[1/4] 导出 ONNX: {filename.replace('.pt', '.onnx')} ...")
     try:
         model = YOLO(pt_path)
+        # ONNX 用 dynamic=True 导出全部维度为动态，第 2 步再固定 H,W
         model.export(
             format="onnx",
             half=enable_fp16,

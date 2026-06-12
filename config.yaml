@@ -44,7 +44,7 @@ srs:
 
 ffmpeg:
   hwaccel: "cuda"
-  video_gpu_id: 0        # 编解码专用 GPU，推理自动使用其余 GPU
+  video_gpu_id: 3        # 编解码专用 GPU，推理自动使用其余 GPU， 根据gpu拓扑图选择
   fallback_cpu: true
   probe_size: 5000000
   analyzeduration: 5000000

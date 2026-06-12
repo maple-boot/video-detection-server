@@ -73,6 +73,17 @@ def setup_logger(config: dict):
         filter=lambda record: record["extra"].get("log_type") == "cleanup",
     )
 
+    # 显存监控日志文件
+    logger.add(
+        os.path.join(log_dir, "memory.log"),
+        level="INFO",
+        format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {extra[task_id]} | {message}",
+        rotation=rotation,
+        retention=retention,
+        encoding="utf-8",
+        filter=lambda record: record["extra"].get("log_type") == "memory",
+    )
+
 
 def get_task_logger(task_id: str, algorithm_id: str = ""):
     """获取任务专属日志器，绑定 task_id 上下文"""
@@ -88,6 +99,11 @@ def get_system_logger():
 def get_cleanup_logger():
     """获取清理专用日志器"""
     return logger.bind(task_id="system", log_type="cleanup")
+
+
+def get_memory_logger():
+    """获取显存监控专用日志器"""
+    return logger.bind(task_id="system", log_type="memory")
 
 
 def get_performance_logger(task_id: str):
