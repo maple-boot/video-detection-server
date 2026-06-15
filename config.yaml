@@ -55,7 +55,7 @@ ffmpeg:
   warmup_frames: 30
   max_reconnect: 10
   stream_stall_threshold: 2.0       # 源流无帧超过此秒数即记录中断告警
-  stream_disconnect_timeout: 10.0   # 源流断流超过此秒数，看门狗直接关闭任务
+  stream_disconnect_timeout: 30.0   # 源流断流超过此秒数，看门狗直接关闭任务
 
 model:
   default_conf: 0.75
@@ -98,6 +98,7 @@ tracker:
   track_high_thresh: 0.5
   track_low_thresh: 0.1
   new_track_thresh: 0.5
+  track_buffer: 3
   track_buffer: 10
   match_thresh: 0.7
   fuse_score: true

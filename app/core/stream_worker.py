@@ -307,13 +307,16 @@ class StreamWorker:
 
             if isinstance(result, tuple) and len(result) == 3:
                 detections, inference_time, raw_results = result
+            elif isinstance(result, tuple) and len(result) == 2:
+                detections, inference_time = result
+                raw_results = []
             else:
                 detections, inference_time, raw_results = [], 0, []
 
-            # 自适应调整间隔（SAHI 慢时允许更大间隔）
+            # 自适应调整间隔 — 即使推理快也强制隔帧检测，降低流水线总耗时
             frame_interval = 1000.0 / 25
             if inference_time < frame_interval * 0.8:
-                self._detection_interval = 1
+                self._detection_interval = 2  # 推理快时隔一帧检测，流水线总耗时减半
             elif inference_time < frame_interval * 1.5:
                 self._detection_interval = 2
             elif inference_time < frame_interval * 3:
