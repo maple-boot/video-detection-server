@@ -108,3 +108,10 @@ tracker:
 # 推理引擎配置
 inference:
   batch_size: 8
+
+# 并行录制配置（直播流同时录制原始视频到本地）
+recording:
+  enabled: true                    # 启用并行录制
+  output_dir: "recordings"         # 录制文件保存目录
+  hwaccel: "cuda"                  # 硬件加速（cuda / qsv / null）
+  segment_seconds: 0               # 分段录制秒数（0=不分段，整段录制）

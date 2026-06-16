@@ -17,6 +17,7 @@ from app.utils.ffmpeg_helper import FFmpegHelper
 from app.utils.detection_util import DetectionUtils
 from app.utils.geo_utils import GeoUtils
 from app.utils.logger import get_task_logger, get_performance_logger
+from app.utils.stream_recorder import StreamRecorder
 from ultralytics.trackers.byte_tracker import BYTETracker
 from ultralytics.engine.results import Results, Boxes
 
@@ -72,6 +73,7 @@ class StreamWorker:
         self.ffmpeg_pusher = None
         self.detector_utils = DetectionUtils(task_id)
         self.geo_utils = GeoUtils(task_id)
+        self.recorder = None  # 流录制器
 
         self.logger = get_task_logger(task_id)
         self.perf_logger = get_performance_logger(task_id)
@@ -122,6 +124,10 @@ class StreamWorker:
         if self.ffmpeg_pusher:
             self.ffmpeg_pusher.stop()
             self.ffmpeg_pusher = None
+        # 停止录制
+        if self.recorder:
+            self.recorder.stop()
+            self.recorder = None
         # 卸载模型池（引用计数 >0 时保留，其他任务仍在使用）
         for alg_id in self.algorithm_ids:
             if self.inference_engine:
@@ -172,6 +178,21 @@ class StreamWorker:
         # 加载模型
         if not self._reload_models_if_needed():
             raise RuntimeError("模型加载失败，任务结束")
+
+        # 启动并行录制
+        recording_config = self.config.get("recording", {})
+        if recording_config.get("enabled", False):
+            self.recorder = StreamRecorder(
+                stream_url=self.stream_url,
+                mp4_file_name=f"{self.task_id}.mp4",
+                output_dir=recording_config.get("output_dir", "recordings"),
+                hwaccel=recording_config.get("hwaccel", self.config.get("ffmpeg", {}).get("hwaccel", "cuda")),
+                segment_seconds=recording_config.get("segment_seconds", 0),
+            )
+            self.recorder.start_async()
+            self.logger.info(f"并行录制已启动 | output={self.recorder.output_path}")
+        else:
+            self.logger.debug("并行录制未启用")
 
         self.state = WorkerState.RUNNING
         self.logger.info("Worker 进入运行状态")
@@ -848,6 +869,9 @@ class StreamWorker:
         """停止 Worker — 快速打断主循环，不置空引用避免竞态"""
         self.logger.info("收到停止信号")
         self._stop_event.set()
+        # 停止录制
+        if self.recorder:
+            self.recorder.stop()
         # 先杀子进程使 read() 立即返回，不置空引用让主循环自然退出
         if self.video_capture:
             self.video_capture.release()
