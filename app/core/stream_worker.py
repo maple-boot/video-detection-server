@@ -18,6 +18,7 @@ from app.utils.detection_util import DetectionUtils
 from app.utils.geo_utils import GeoUtils
 from app.utils.logger import get_task_logger, get_performance_logger
 from app.utils.stream_recorder import StreamRecorder
+from app.utils.box_smoother import BoxSmoother
 from ultralytics.trackers.byte_tracker import BYTETracker
 from ultralytics.engine.results import Results, Boxes
 
@@ -82,6 +83,8 @@ class StreamWorker:
         # ByteTrack 追踪器（每个算法独立）
         self._trackers = {}
         self._track_args = TrackArgs(config)
+        # 检测框平滑器（每个算法独立）
+        self._box_smoothers = {}
         # 活跃检测，追踪上报限制
         self._active_tracks = {}
         self._latest_annotated_frames = {}
@@ -199,6 +202,18 @@ class StreamWorker:
 
         # 预热帧数（跳过 FFmpeg 解码器初始化期间的脏数据）
         warmup_frames = self.config.get("ffmpeg", {}).get("warmup_frames", 15)
+
+        # ============================================================
+        # [临时功能] 定时帧截图 — 每5秒保存一帧原始解码图到指定文件夹
+        # 用途：排查录制花屏问题，确认解码帧是否正常
+        # 删除时搜索关键字: TEMP_FRAME_SNAPSHOT
+        # ============================================================
+        _snapshot_dir = os.path.join("debug_frames", self.task_id)
+        os.makedirs(_snapshot_dir, exist_ok=True)
+        _snapshot_interval = 5  # 秒
+        _last_snapshot_time = time.time()
+        self.logger.info(f"[临时功能] 帧截图已启用 | 每 {_snapshot_interval}s 保存一帧 | 目录={_snapshot_dir}")
+        # ============================================================
         # 模型检测预热：用空白帧做一次推理，避免首次检测到物体时的 TensorRT 尖峰
         self._run_detection_warmup()
         # 主循环
@@ -238,6 +253,26 @@ class StreamWorker:
 
             self._frame_count += 1
             self._skip_counter += 1
+
+            # ============================================================
+            # [临时功能] TEMP_FRAME_SNAPSHOT — 每5秒保存一帧解码原始画面
+            # 用于排查录制花屏问题，确认 FFmpeg 解码输出是否正常
+            # 删除时移除此代码块（从 [临时功能] 到该块结束）
+            # ============================================================
+            if time.time() - _last_snapshot_time >= _snapshot_interval:
+                _last_snapshot_time = time.time()
+                try:
+                    _snapshot_name = f"frame_{self._frame_count}_{int(time.time())}.jpg"
+                    _snapshot_path = os.path.join(_snapshot_dir, _snapshot_name)
+                    cv2.imwrite(_snapshot_path, frame)
+                    self.logger.info(
+                        f"[临时功能] 帧截图已保存 | frame={self._frame_count} | "
+                        f"path={_snapshot_path}"
+                    )
+                except Exception as snap_err:
+                    self.logger.warning(f"[临时功能] 帧截图保存失败: {snap_err}")
+            # ============================================================
+
             # 预热/检测前检查停止信号
             if self._stop_event.is_set():
                 break
@@ -251,10 +286,13 @@ class StreamWorker:
                 if warmup_frames == 0:
                     for alg_id in self.algorithm_ids:
                         self._trackers[alg_id] = BYTETracker(args=self._track_args, frame_rate=25)
+                        # 重置框平滑器
+                        if alg_id in self._box_smoothers:
+                            self._box_smoothers[alg_id].reset()
                     self._active_tracks.clear()
                     self._latest_annotated_frames.clear()
                     self._last_detections.clear()
-                    self.logger.info(f"预热完成，开始检测 | 跳过帧数={self.config.get('ffmpeg', {}).get('warmup_frames', 15)}, 重置追踪器")
+                    self.logger.info(f"预热完成，开始检测 | 跳过帧数={self.config.get('ffmpeg', {}).get('warmup_frames', 15)}, 重置追踪器+平滑器")
                 continue
 
             # 对每个算法执行检测
@@ -356,10 +394,19 @@ class StreamWorker:
             elif raw_results:
                 detections = self._track(alg_id, detections, frame, raw_results)
 
+            # 框平滑（检测帧）
+            smoother = self._box_smoothers.get(alg_id)
+            if smoother and detections:
+                detections = smoother.update_on_detection(detections, self._detection_interval)
+
             if detections:
                 self._last_detections[alg_id] = detections
             return self._last_detections.get(alg_id, []), inference_time
         else:
+            # 跳帧：使用平滑器返回稳定的显示位置
+            smoother = self._box_smoothers.get(alg_id)
+            if smoother:
+                return smoother.get_display_boxes(), 0
             return self._last_detections.get(alg_id, []), 0
 
     def _track_from_detections(self, alg_id: str, detections: list, frame: np.ndarray) -> list:
@@ -419,9 +466,20 @@ class StreamWorker:
 
     def _reload_models_if_needed(self) -> bool:
         """检查模型是否已加载，未加载则从数据库重新加载"""
+        smoothing_config = self.config.get("box_smoothing", {})
         for alg_id in self.algorithm_ids:
             self._trackers[alg_id] = BYTETracker(args=self._track_args, frame_rate=25)
             self.logger.info(f"ByteTrack 追踪器初始化完成 | algorithm_id={alg_id}")
+
+            # 初始化检测框平滑器
+            if smoothing_config.get("enabled", False):
+                self._box_smoothers[alg_id] = BoxSmoother(
+                    alpha=smoothing_config.get("alpha", 0.2),
+                    noise_threshold=smoothing_config.get("noise_threshold", 12),
+                    iou_threshold=smoothing_config.get("iou_threshold", 0.3),
+                    grace_period=smoothing_config.get("grace_period", 15),
+                )
+                self.logger.info(f"检测框平滑已启用 | algorithm_id={alg_id} | alpha={smoothing_config.get('alpha', 0.2)}")
 
             loaded_models = self.inference_engine.get_loaded_models()
             if alg_id not in loaded_models:
@@ -781,10 +839,12 @@ class StreamWorker:
             current_ids = set()
             self._check_dropped_tracks(alg_id, current_ids)
 
-        # 重置 ByteTracker，避免跨视频循环 track_id 连续递增
+        # 重置 ByteTracker 和框平滑器
         for alg_id in self.algorithm_ids:
             self._trackers[alg_id] = BYTETracker(args=self._track_args, frame_rate=25)
-            self.logger.info(f"视频结束，ByteTrack 追踪器已重置 | algorithm_id={alg_id}")
+            if alg_id in self._box_smoothers:
+                self._box_smoothers[alg_id].reset()
+            self.logger.info(f"视频结束，ByteTrack 追踪器+平滑器已重置 | algorithm_id={alg_id}")
 
         # 清空活跃轨迹缓存
         self._active_tracks.clear()

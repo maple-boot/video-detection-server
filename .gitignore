@@ -167,3 +167,5 @@ cython_debug/
 .dataset_mark/
 .dataset_upload/
 .recordings/
+.mp4
+.debug_frames

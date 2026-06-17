@@ -109,6 +109,14 @@ tracker:
 inference:
   batch_size: 8
 
+# 检测框平滑配置（消除跳帧推理导致的框抖动）
+box_smoothing:
+  enabled: true              # 是否启用检测框平滑
+  alpha: 0.2                 # EMA 平滑系数 (0,1]，越小越平滑
+  noise_threshold: 12        # 噪声过滤阈值（像素），偏移小于此值不移动框
+  iou_threshold: 0.3         # IoU 回退匹配阈值（track_id 重分配时）
+  grace_period: 15           # 消失轨迹保留帧数（IoU 匹配用）
+
 # 并行录制配置（直播流同时录制原始视频到本地）
 recording:
   enabled: true                    # 启用并行录制
