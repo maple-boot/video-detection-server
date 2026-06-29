@@ -11,3 +11,4 @@ numpy==1.26.3
 psutil==5.9.8
 pyyaml==6.0.1
 lap==0.5.13
+pillow>=10.0.0

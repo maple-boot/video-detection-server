@@ -84,7 +84,8 @@ class ModelPool:
                 free_bytes, total_bytes = torch.cuda.mem_get_info(gpu_id)
                 if self.is_tensorrt:
                     engine_size_mb = os.path.getsize(self.model_path) / (1 << 20)
-                    estimated_mib = max(engine_size_mb * 300, 4096)
+                    # TensorRT engine 加载后显存 ≈ 文件大小的 1-3 倍（含 CUDA context / workspace）
+                    estimated_mib = max(engine_size_mb * 3, 2048)
                     min_free_bytes = int(estimated_mib * (1 << 20))
                 else:
                     min_free_bytes = 4 * (1 << 30)
@@ -332,7 +333,8 @@ class InferenceEngine:
             return 4096
         size_mb = os.path.getsize(model_path) / (1 << 20)
         if model_path.endswith(".engine"):
-            return int(max(size_mb * 300, 4096))
+            # TensorRT engine 加载后显存 ≈ 文件大小的 1-3 倍（含 CUDA context / workspace）
+            return int(max(size_mb * 3, 2048))
         return 4096  # PyTorch 模型保守估计 4GiB
 
     def _evict_oldest(self, keep_alg_id: str) -> bool:

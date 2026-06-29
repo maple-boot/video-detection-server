@@ -1,5 +1,11 @@
 import datetime
+import json
+import os
+import re
 import time
+import cv2
+from pydantic import BaseModel
+from typing import List, Optional
 from fastapi import APIRouter
 from app.models.schemas import StreamRequest, StreamUrlRequest, LocationRequest, StopTaskRequest
 from app.utils.response_helper import ResponseHelper
@@ -13,6 +19,14 @@ router = APIRouter()
 _supervisor = None
 _orm_helper = None
 _config = None
+_minio_helper = None
+
+
+class TransferDetectionBoxRequest(BaseModel):
+    """检测框转移请求"""
+    recognized_image_path: str  # 识别后图片在MinIO中的object key
+    unrecognized_image_path: str  # 未识别图片在MinIO中的object key
+    bounding_boxes: str  # 边界框坐标字符串，格式为 "[[x1, y1, x2, y2], ...]" 或 "[x1, y1, x2, y2]"
 
 
 def _get_push_url_prefix():
@@ -22,11 +36,12 @@ def _get_push_url_prefix():
     return "rtmp://localhost/live/stream/"
 
 
-def init_stream_api(supervisor, orm_helper, config=None):
-    global _supervisor, _orm_helper, _config
+def init_stream_api(supervisor, orm_helper, config=None, minio_helper=None):
+    global _supervisor, _orm_helper, _config, _minio_helper
     _supervisor = supervisor
     _orm_helper = orm_helper
     _config = config
+    _minio_helper = minio_helper
 
 
 @router.post("/stream")
@@ -60,7 +75,7 @@ async def start_stream(request: StreamRequest):
             stream_url = stream_url.replace("webrtc", "rtmp")
 
         # 判断流类型
-        is_file = stream_url.endswith(".mp4") or stream_url.endswith(".avi") or stream_url.endswith(".mkv")
+        is_file = ".mp4" in stream_url or ".avi" in stream_url or ".mkv" in stream_url
 
         if is_file:
             output_path = f"output/{task_id}_output.mp4"
@@ -212,3 +227,118 @@ async def save_task_location(request: LocationRequest):
     except Exception as e:
         logger.error(f"保存定位信息异常: {e}")
         return ResponseHelper.error(f"保存异常: {str(e)}")
+
+@router.post("/transfer_detection_box")
+async def transfer_detection_box_api(request: TransferDetectionBoxRequest):
+    """
+    在图片上绘制检测框的接口
+    将识别框坐标从未识别图片转移到标注后的图片上
+    """
+    try:
+        if not _minio_helper:
+            return ResponseHelper.error("MinIO 未初始化")
+
+        # 验证参数
+        if not request.recognized_image_path or not isinstance(request.recognized_image_path, str):
+            return ResponseHelper.bad_request("recognized_image_path 参数必须是有效的字符串")
+
+        if not request.unrecognized_image_path or not isinstance(request.unrecognized_image_path, str):
+            return ResponseHelper.bad_request("unrecognized_image_path 参数必须是有效的字符串")
+
+        if not request.bounding_boxes or not isinstance(request.bounding_boxes, str):
+            return ResponseHelper.bad_request("bounding_boxes 参数必须是有效的字符串")
+
+        logger.info(f"transfer_detection_box | recognized_image_path={request.recognized_image_path} | bounding_boxes={request.bounding_boxes}")
+
+        # 解析字符串格式的bounding_boxes参数
+        try:
+            parsed_bounding_boxes = json.loads(request.bounding_boxes)
+
+            if isinstance(parsed_bounding_boxes, list) and len(parsed_bounding_boxes) > 0:
+                # 单个边界框格式 [x1, y1, x2, y2]
+                if len(parsed_bounding_boxes) == 4 and all(isinstance(coord, (int, float)) for coord in parsed_bounding_boxes):
+                    bounding_boxes = [parsed_bounding_boxes]
+                # 多个边界框格式 [[x1, y1, x2, y2], ...]
+                elif all(isinstance(box, list) and len(box) == 4 and all(isinstance(coord, (int, float)) for coord in box) for box in parsed_bounding_boxes):
+                    bounding_boxes = parsed_bounding_boxes
+                else:
+                    return ResponseHelper.bad_request("bounding_boxes 格式不正确，应为 [x1, y1, x2, y2] 或 [[x1, y1, x2, y2], ...] 的JSON字符串")
+            else:
+                return ResponseHelper.bad_request("bounding_boxes 参数解析后应为包含坐标列表的数组")
+        except json.JSONDecodeError:
+            return ResponseHelper.bad_request("bounding_boxes 参数必须是有效的JSON字符串")
+
+        # 验证并清理 object_key，防止包含空字符
+        if '\x00' in request.recognized_image_path:
+            return ResponseHelper.bad_request("recognized_image_path 包含无效字符")
+        if '\x00' in request.unrecognized_image_path:
+            return ResponseHelper.bad_request("unrecognized_image_path 包含无效字符")
+
+        # 移除控制字符
+        clean_recognized_key = re.sub(r'[\x00-\x1f\x7f]', '', request.recognized_image_path)
+        clean_unrecognized_key = re.sub(r'[\x00-\x1f\x7f]', '', request.unrecognized_image_path)
+
+        # 从MinIO下载图片到临时文件
+        recognized_local_path = _minio_helper.download_file(clean_recognized_key)
+        unrecognized_local_path = _minio_helper.download_file(clean_unrecognized_key)
+
+        try:
+            # 读取图片
+            recognized_img = cv2.imread(recognized_local_path)
+            unrecognized_img = cv2.imread(unrecognized_local_path)
+
+            if recognized_img is None:
+                return ResponseHelper.bad_request(f"无法读取识别后图片: {clean_recognized_key}")
+            if unrecognized_img is None:
+                return ResponseHelper.bad_request(f"无法读取未识别图片: {clean_unrecognized_key}")
+
+            # 检查两张图片尺寸是否相同
+            if recognized_img.shape != unrecognized_img.shape:
+                return ResponseHelper.bad_request("识别后图片和未识别图片尺寸不一致")
+
+            # 在未识别图片上绘制检测框
+            annotated_img = unrecognized_img.copy()
+
+            if bounding_boxes:
+                x1, y1, x2, y2 = bounding_boxes[0]
+                x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+
+                height, width = annotated_img.shape[:2]
+                x1 = max(0, min(x1, width - 1))
+                y1 = max(0, min(y1, height - 1))
+                x2 = max(0, min(x2, width))
+                y2 = max(0, min(y2, height))
+
+                if x2 <= x1 or y2 <= y1:
+                    return ResponseHelper.bad_request(f"无效的坐标范围: x1={x1}, y1={y1}, x2={x2}, y2={y2}")
+
+                # 绘制红色框
+                cv2.rectangle(annotated_img, (x1, y1), (x2, y2), (0, 0, 255), 2)
+
+            # 生成输出文件名
+            safe_key = clean_recognized_key.replace('/', '_').replace('\\', '_')
+            base_name = os.path.splitext(os.path.basename(safe_key))[0] if '.' in safe_key else safe_key
+            output_filename = f"{base_name}_transfer_annotated.jpg"
+
+            # 编码图片并上传到MinIO
+            _, buffer = cv2.imencode('.jpg', annotated_img, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+            image_bytes = buffer.tobytes()
+
+            result_object_key = _minio_helper.upload_bytes(image_bytes, output_filename)
+
+            logger.info(f"transfer_detection_box 完成 | result={result_object_key}")
+
+            return ResponseHelper.success(
+                data={"result_path": result_object_key},
+                message="检测框转移完成"
+            )
+
+        finally:
+            # 清理临时文件
+            for local_path in [recognized_local_path, unrecognized_local_path]:
+                if local_path and os.path.exists(local_path):
+                    os.remove(local_path)
+
+    except Exception as e:
+        logger.error(f"transfer_detection_box 异常: {e}")
+        return ResponseHelper.error(f"处理图片时发生错误: {str(e)}")

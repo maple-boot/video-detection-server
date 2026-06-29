@@ -1,0 +1,14 @@
+orm:
+  db_type: mysql
+  host: 192.168.10.1
+  port: 3306
+  username: nbuav_user
+  password: MGg#gWl89jvz8009@cehui_final
+  database: nbuav
+
+minio:
+  endpoint: 112.14.53.185:9000
+  access_key: hxm
+  secret_key: "nbuav@2024"
+  secure: false
+  bucket_name: nbuav

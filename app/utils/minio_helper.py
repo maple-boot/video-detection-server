@@ -1,3 +1,4 @@
+import os
 from datetime import timedelta
 from minio import Minio
 from minio.error import S3Error
@@ -88,6 +89,22 @@ class MinioHelper:
         bucket = cfg["bucket"]
         protocol = "https" if cfg["client"]._base_url._url.scheme == "https" else "http"
         return f"{protocol}://{endpoint}/{bucket}/{object_name}"
+
+    def download_file(self, object_name: str, file_path: str = None, minio_name: str = "default") -> str:
+        """从 MinIO 下载文件到本地临时目录"""
+        import tempfile
+        import re
+        safe_object_name = re.sub(r'[\x00-\x1f\x7f]', '', object_name)
+
+        client, bucket = self.get_client(minio_name)
+
+        if file_path is None:
+            _, ext = os.path.splitext(safe_object_name)
+            file_path = os.path.join(tempfile.gettempdir(), os.urandom(8).hex() + (ext or '.tmp'))
+
+        client.fget_object(bucket, safe_object_name, file_path)
+        logger.info(f"文件下载成功 | bucket={bucket} | object={safe_object_name} -> {file_path}")
+        return file_path
 
     def delete_file(self, object_name: str, minio_name: str = "default") -> bool:
         """删除文件"""

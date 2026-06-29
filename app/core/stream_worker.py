@@ -92,7 +92,7 @@ class StreamWorker:
         self._last_frame_time = time.time()
         self._stream_stall_warned = False
         self._stream_stall_threshold = self.config.get("ffmpeg", {}).get("stream_stall_threshold", 3.0)
-        self._stream_disconnect_timeout = self.config.get("ffmpeg", {}).get("stream_disconnect_timeout", 10.0)
+        self._stream_disconnect_timeout = self.config.get("ffmpeg", {}).get("stream_disconnect_timeout", 30.0)
         self._stall_watchdog = None
         self._stall_watchdog_stop = threading.Event()
         # 连续检测配置
