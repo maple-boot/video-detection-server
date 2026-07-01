@@ -83,7 +83,11 @@ class MP4Worker:
         for alg_id in self.algorithm_ids:
             model_info = self.config.get("_model_info", {}).get(alg_id)
             if model_info:
-                self.inference_engine.load_model(alg_id, model_info["model_path"], model_info.get("classes_path", ""))
+                inference_size = model_info.get("inference_size") or 640
+                self.inference_engine.load_model(
+                    alg_id, model_info["model_path"], model_info.get("classes_path", ""),
+                    imgsz=inference_size,
+                )
 
         self.state = MP4WorkerState.RUNNING
 
@@ -100,9 +104,11 @@ class MP4Worker:
             # 检测（每帧都跑）
             annotated_frame = frame.copy()
             for alg_id in self.algorithm_ids:
+                model_imgsz = self.inference_engine.get_model_imgsz(alg_id)
                 detections, inference_time = self.inference_engine.detect(
                     alg_id, frame,
                     conf=self.config.get("model", {}).get("default_conf", 0.75),
+                    imgsz=model_imgsz,
                 )
 
                 # 绘制（不做上报过滤，显示所有结果）

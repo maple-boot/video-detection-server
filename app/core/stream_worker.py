@@ -487,10 +487,12 @@ class StreamWorker:
                 if self.orm_helper:
                     model_info = self.orm_helper.get_model_info(alg_id)
                     if model_info:
+                        inference_size = model_info.inference_size or 640
                         # 记录模型推理切片大小（训练时的 imgsz），SAHI 切片时使用
-                        self._model_inference_sizes[alg_id] = model_info.inference_size or 640
+                        self._model_inference_sizes[alg_id] = inference_size
                         success = self.inference_engine.load_model(
-                            alg_id, model_info.model_path, model_info.cls_path
+                            alg_id, model_info.model_path, model_info.cls_path,
+                            imgsz=inference_size,
                         )
                         if not success:
                             self.logger.error(f"模型重新加载失败 | algorithm_id={alg_id}")
@@ -502,7 +504,12 @@ class StreamWorker:
                     self.logger.error(f"无数据库连接，无法加载模型 | algorithm_id={alg_id}")
                     return False
             else:
-                self.logger.debug(f"模型已加载 | algorithm_id={alg_id}")
+                # 模型已被其他任务加载，从引擎获取实际的推理输入尺寸
+                self._model_inference_sizes[alg_id] = self.inference_engine.get_model_imgsz(alg_id)
+                self.logger.debug(
+                    f"模型已加载 | algorithm_id={alg_id} | "
+                    f"imgsz={self._model_inference_sizes[alg_id]}"
+                )
         return True
 
     def _start_stall_watchdog(self):

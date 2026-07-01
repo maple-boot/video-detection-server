@@ -34,7 +34,7 @@ class ModelPool:
             return {}
 
     def __init__(self, algorithm_id: str, model_path: str,
-                 classes: list, gpu_ids: list, batch_size: int = 8):
+                 classes: list, gpu_ids: list, batch_size: int = 8, imgsz: int = 640):
         self.algorithm_id = algorithm_id
         self.model_path = model_path
         self.classes = classes
@@ -42,15 +42,21 @@ class ModelPool:
         self.is_tensorrt = model_path.endswith(".engine")
         self.model_type = "TensorRT" if self.is_tensorrt else "PyTorch"
         self.batch_size = batch_size
+        self.imgsz = imgsz
 
         self._models = {}      # gpu_id -> YOLO model
         self._queues = {}      # gpu_id -> Queue
         self._workers = []     # worker threads
 
-        # 从 engine 文件元数据中读取 batch
+        # 从 engine 文件元数据中读取 batch 和 imgsz
         if self.is_tensorrt:
             try:
                 _meta = self._read_engine_metadata(self.model_path)
+                logger.info(
+                    f"引擎元数据 | algorithm_id={self.algorithm_id} | "
+                    f"keys={list(_meta.keys())} | "
+                    f"imgsz={_meta.get('imgsz')} | batch={_meta.get('batch')}"
+                )
                 if "batch" in _meta:
                     _engine_batch = int(_meta["batch"])
                     if _engine_batch != self.batch_size:
@@ -59,10 +65,22 @@ class ModelPool:
                             f"engine_batch={_engine_batch} | config_batch={self.batch_size}"
                         )
                         self.batch_size = _engine_batch
+                # 从引擎元数据中读取 imgsz（优先使用引擎自带的尺寸）
+                if "imgsz" in _meta:
+                    _raw_imgsz = _meta["imgsz"]
+                    if isinstance(_raw_imgsz, (list, tuple)):
+                        _engine_imgsz = int(_raw_imgsz[0])
+                    else:
+                        _engine_imgsz = int(_raw_imgsz)
+                    self.imgsz = _engine_imgsz
+                    logger.info(
+                        f"引擎 imgsz 覆盖 | algorithm_id={self.algorithm_id} | "
+                        f"engine_imgsz={_engine_imgsz} | config_imgsz={imgsz}"
+                    )
             except Exception as e:
                 logger.warning(
-                    f"无法从 engine 元数据读取 batch | algorithm_id={self.algorithm_id} | "
-                    f"error={e}（使用配置 batch={self.batch_size}）"
+                    f"无法从 engine 元数据读取配置 | algorithm_id={self.algorithm_id} | "
+                    f"error={e}（使用配置 batch={self.batch_size}, imgsz={self.imgsz}）"
                 )
 
         self._load_models()
@@ -100,11 +118,11 @@ class ModelPool:
                 # 加载（不传 device，让 YOLO 自动绑定到当前默认设备）
                 model = YOLO(self.model_path)
 
-                # Warmup：单帧，不传 device/batch
-                dummy = np.zeros((640, 640, 3), dtype=np.uint8)
+                # Warmup：使用引擎实际输入尺寸，不传 device/batch
+                dummy = np.zeros((self.imgsz, self.imgsz, 3), dtype=np.uint8)
                 if self.is_tensorrt:
                     for _ in range(min(self.batch_size, 4)):
-                        model.predict(dummy, verbose=False)
+                        model.predict(dummy, imgsz=self.imgsz, verbose=False)
                 else:
                     model.predict(dummy, verbose=False)
 
@@ -357,7 +375,7 @@ class InferenceEngine:
             return True
         return False
 
-    def load_model(self, algorithm_id: str, model_path: str, classes_path: str = "") -> bool:
+    def load_model(self, algorithm_id: str, model_path: str, classes_path: str = "", imgsz: int = 640) -> bool:
         with self._lock:
             if algorithm_id in self._pools:
                 self._pool_refcount[algorithm_id] += 1
@@ -407,6 +425,7 @@ class InferenceEngine:
                     classes=classes,
                     gpu_ids=list(self._inference_gpu_ids),
                     batch_size=self._batch_size,
+                    imgsz=imgsz,
                 )
 
                 self._pools[algorithm_id] = pool
@@ -598,6 +617,13 @@ class InferenceEngine:
 
     def get_loaded_models(self) -> list:
         return list(self._pools.keys())
+
+    def get_model_imgsz(self, algorithm_id: str) -> int:
+        """获取已加载模型的实际推理输入尺寸（从引擎元数据或初始化时传入的 imgsz）"""
+        pool = self._pools.get(algorithm_id)
+        if pool is not None:
+            return pool.imgsz
+        return 640
 
     def clear_cache(self):
         with self._lock:
